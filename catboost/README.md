@@ -14,6 +14,14 @@ catboost 1.2.10 で検証済み。すべてのシグネチャ・実行結果は 
 8. [評価指標・可視化](#8-評価指標可視化)
 9. [ハイパーパラメータ・その他ユーティリティ](#9-ハイパーパラメータその他ユーティリティ)
 
+## 応用・発展
+
+10. [単調性制約](#10-単調性制約)
+11. [埋め込み特徴量](#11-埋め込み特徴量)
+12. [SHAP値の応用・モデル解釈の深掘り](#12-shap値の応用モデル解釈の深掘り)
+13. [モデルの評価・比較](#13-モデルの評価比較)
+14. [アンサンブル・スタッキングとの組み合わせ](#14-アンサンブルスタッキングとの組み合わせ)
+
 ---
 
 ## 1. Pool・学習基礎
@@ -875,3 +883,532 @@ tree_count_: 30
 **注意点・落とし穴**:
 - numpy配列で学習した場合、`feature_names_`は列インデックスを文字列化しただけの値(`'0'`, `'1'`, ...)になる。意味のある特徴量名を残したい場合はpandas DataFrameで学習する。
 - `early_stopping_rounds`や過学習検出器で途中停止した場合、`tree_count_`は指定した`iterations`より小さくなる(前述の「Ordered Boosting・過学習対策」参照)。
+
+---
+
+## 10. 単調性制約
+
+### `monotone_constraints`(リスト形式)
+
+**用途**: 特定の特徴量について「その特徴量が増えるほど予測値は単調に増加(または減少)する」という制約を課す。解釈性が求められる場面(与信スコアなど、特徴量と予測値の関係が直感に反してはいけない場合)で使う。
+
+**シグネチャ**: `CatBoostRegressor(..., monotone_constraints=None, ...)`(`CatBoostClassifier`にも同じ引数がある。特徴量の順序に対応する`1`(増加制約)・`-1`(減少制約)・`0`(制約なし)のリスト、または特徴量インデックス/列名をキーにした辞書、`"(1,-1,0)"`のような文字列でも指定可能)
+
+**使用例**:
+```python
+import numpy as np
+from catboost import CatBoostRegressor
+
+rng = np.random.default_rng(0)
+n = 150
+x1 = rng.uniform(0, 10, n)
+x2 = rng.uniform(0, 10, n)
+noise = rng.normal(0, 3.0, n)
+y = 2 * x1 - 1.5 * x2 + noise  # 本来 x1 に対して増加、x2 に対して減少するはずの関係
+X = np.column_stack([x1, x2])
+
+reg_free = CatBoostRegressor(iterations=300, depth=6, verbose=False, random_seed=0)
+reg_free.fit(X, y)
+reg_mono = CatBoostRegressor(iterations=300, depth=6, verbose=False, random_seed=0,
+                              monotone_constraints=[1, -1])
+reg_mono.fit(X, y)
+
+# x2を5に固定し、x1だけを動かして予測値の変化を見る
+x1_test = np.linspace(0, 10, 15)
+x2_fixed = np.full(15, 5.0)
+Xtest = np.column_stack([x1_test, x2_fixed])
+diff_free = np.diff(reg_free.predict(Xtest))
+diff_mono = np.diff(reg_mono.predict(Xtest))
+print("制約なし: 単調増加か?", bool(np.all(diff_free >= -1e-9)))
+print("制約なしの差分:", diff_free.round(3))
+print("制約ありモデルは単調増加か?", bool(np.all(diff_mono >= -1e-9)))
+print("制約ありの差分:", diff_mono.round(3))
+```
+実行結果:
+```
+制約なし: 単調増加か? False
+制約なしの差分: [ 3.177  0.023  4.199  0.972  1.048  2.137  1.127  0.802  0.32   0.343
+  1.596  2.015  3.392 -1.262]
+制約ありモデルは単調増加か? True
+制約ありの差分: [3.397 0.363 2.356 2.13  0.387 2.032 0.695 0.512 0.994 0.44  1.202 2.127
+ 2.374 1.581]
+```
+
+**注意点・落とし穴**:
+- 制約なしモデルは、ノイズの影響で局所的に単調性が崩れている(最後の区間で差分が`-1.262`と負になっている)のに対し、`monotone_constraints=[1, -1]`を指定したモデルは検証した15点すべてで単調増加が保たれていることを実際に確認した。
+- `depth`が浅い(単純な)データでは制約なしでも自然に単調になることがあるため、制約の効果を確認する際はある程度ノイズの多いデータ・深い木で検証しないと違いが見えにくい。
+
+### `monotone_constraints`(辞書形式・列名指定)
+
+**用途**: pandas DataFrameで学習する場合に、列名をキーにして単調性制約を指定する(リスト形式より可読性が高い)。
+
+**シグネチャ**: 上記と同じ(`monotone_constraints={"列名": 1, ...}`の形式)。
+
+**使用例**:
+```python
+import pandas as pd
+from catboost import CatBoostRegressor
+
+df = pd.DataFrame({"a": x1, "b": x2, "c": rng.uniform(0, 10, n)})
+reg_dict = CatBoostRegressor(iterations=200, depth=6, verbose=False, random_seed=0,
+                              monotone_constraints={"a": 1, "b": -1})
+reg_dict.fit(df, y)
+print(reg_dict.get_all_params().get("monotone_constraints"))
+```
+実行結果:
+```
+{'1': -1, '0': 1}
+```
+
+**注意点・落とし穴**:
+- `get_all_params()`で確認すると、辞書形式・列名指定で渡した制約は内部的に「列インデックス(文字列)→制約値」の辞書に正規化される。指定していない列(`"c"`、インデックス`2`)はキーごと出力から省かれる(制約なし=`0`として扱われるが、辞書には現れない)。
+- 文字列形式(`"(1,-1,0)"`)・リスト形式・辞書形式のいずれで渡しても、`get_all_params()`上は同じ正規化された辞書表現になることを確認した。
+
+---
+
+## 11. 埋め込み特徴量
+
+### `embedding_features`(DataFrameの配列列で指定)
+
+**用途**: 事前学習済み埋め込み(文章embeddingや画像embeddingなど、固定長ベクトル)をそのまま1つの特徴量列として扱う。ベクトルを自分でPCAなどで次元圧縮したり個々の要素に展開したりせずに済む。
+
+**シグネチャ**: `catboost.Pool(data, label=None, cat_features=None, text_features=None, embedding_features=None, embedding_features_data=None, ...)` / `CatBoostClassifier(..., embedding_features=None, ...)`
+
+**使用例**:
+```python
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from catboost import CatBoostClassifier
+
+rng = np.random.default_rng(0)
+n = 300
+num_feat = rng.normal(size=(n, 2))
+emb = rng.normal(size=(n, 4))  # 4次元の「埋め込みベクトル」を模したデータ
+y = (num_feat[:, 0] + emb[:, 0] - emb[:, 1] > 0).astype(int)
+
+df = pd.DataFrame({"f0": num_feat[:, 0], "f1": num_feat[:, 1]})
+df["emb"] = list(emb)  # 1列にベクトル(numpy配列)を格納
+
+df_tr, df_te, y_tr, y_te = train_test_split(df, y, test_size=0.25, random_state=0)
+
+clf = CatBoostClassifier(iterations=100, verbose=False, random_seed=0, embedding_features=["emb"])
+clf.fit(df_tr, y_tr)
+print("score:", clf.score(df_te, y_te))
+print("get_embedding_feature_indices():", clf.get_embedding_feature_indices())
+```
+実行結果:
+```
+score: 0.8666666666666667
+get_embedding_feature_indices(): [2]
+```
+
+**注意点・落とし穴**:
+- `embedding_features`を指定せずにベクトル(配列)を含む列をそのまま`fit`すると、`CatBoostError: ... Cannot convert obj [...] to float`が発生することを確認済み。ベクトル列は通常の数値特徴量として自動認識されないため、必ず`embedding_features`で明示する必要がある。
+- `clf.get_all_params()`の出力には`embedding_features`キー自体が(`None`のまま)現れず、実際に使われたかどうかは`get_embedding_feature_indices()`で確認する必要がある。
+
+### `embedding_features_data`(numpy配列を分離して渡す)
+
+**用途**: pandasを使わず、通常の特徴量行列とは別のnumpy 2次元配列として埋め込みベクトルを渡す方法。
+
+**シグネチャ**: `catboost.Pool(data, label=None, ..., embedding_features=None, embedding_features_data=None, ...)`(`embedding_features_data`は2次元配列のリスト。`embedding_features`側には、通常特徴量の末尾に続く「仮想列インデックス」を指定する)
+
+**使用例**:
+```python
+import numpy as np
+from catboost import CatBoostClassifier, Pool
+
+rng = np.random.default_rng(0)
+n = 200
+num_feat = rng.normal(size=(n, 2))
+emb = rng.normal(size=(n, 4))
+y = (num_feat[:, 0] + emb[:, 0] - emb[:, 1] > 0).astype(int)
+
+# num_feat は2列なので、埋め込み列の仮想インデックスは2
+pool = Pool(num_feat, y, embedding_features=[2], embedding_features_data=[emb])
+print("pool.shape:", pool.shape)
+clf = CatBoostClassifier(iterations=50, verbose=False, random_seed=0)
+clf.fit(pool)
+print("score:", clf.score(pool))
+print("get_embedding_feature_indices():", clf.get_embedding_feature_indices())
+```
+実行結果:
+```
+pool.shape: (200, 3)
+score: 0.96
+get_embedding_feature_indices(): [2]
+```
+
+**注意点・落とし穴**:
+- `embedding_features_data`だけを渡し`embedding_features`を省略すると、`CatBoostError: 'embedding_features_data' is not None, but 'embedding_features' parameter is not specified`になることを確認済み。両方をセットで指定する必要がある。
+- `embedding_features`に指定するインデックスは「通常特徴量の列数」を起点にした仮想的な位置(この例では`num_feat`が2列なので`2`)であり、`embedding_features_data`内のリストの並び順と対応する。`pool.shape`の列数(`3`)は「通常特徴量2列+埋め込み列1列」で、埋め込みベクトルの次元数(4)はカウントされない。
+
+---
+
+## 12. SHAP値の応用・モデル解釈の深掘り
+
+### `.get_feature_importance(type="Interaction")`
+
+**用途**: 2つの特徴量の組み合わせがどれだけ強く相互作用しているかを、特徴量ペアごとにスコアリングする(SHAPではなく、木構造の分割パターンに基づく指標)。
+
+**シグネチャ**: `CatBoostClassifier.get_feature_importance(self, data=None, type=<EFstrType.FeatureImportance: 2>, prettified=False, ...)`(`type="Interaction"`を指定)
+
+**使用例**:
+```python
+from sklearn.datasets import make_classification
+from catboost import CatBoostClassifier, Pool
+
+Xf, yf = make_classification(n_samples=300, n_features=6, n_informative=3, n_classes=2, random_state=0)
+clf_fi = CatBoostClassifier(iterations=50, verbose=False, random_seed=0)
+clf_fi.fit(Xf, yf)
+pool_fi = Pool(Xf, yf)
+
+inter = clf_fi.get_feature_importance(pool_fi, type="Interaction")
+print(inter[:3])
+```
+実行結果:
+```
+[[ 1.          5.         20.36029227]
+ [ 2.          5.         14.24694255]
+ [ 1.          3.         13.50224016]]
+```
+
+**注意点・落とし穴**:
+- 戻り値は`(特徴量ペア数, 3)`のnumpy配列で、各行が「特徴量インデックス1, 特徴量インデックス2, 相互作用スコア」。スコアの降順にソート済みで返る(6特徴量なので`C(6,2)=15`行になる)。
+- あくまで「相互作用の強さ」の指標であり、SHAP値のように個々の予測への寄与を分解するものではない(個々の予測レベルの相互作用が欲しい場合は次項の`ShapInteractionValues`を使う)。
+
+### `.get_feature_importance(type="ShapInteractionValues")`
+
+**用途**: 通常のSHAP値(各特徴量の寄与)をさらに「特徴量ペアごとの寄与」に分解する。ある特徴量の寄与が別の特徴量の値に依存して変わる場合(交互作用効果)を個々の予測レベルで確認できる。
+
+**シグネチャ**: 上記`get_feature_importance`と同じ(`type="ShapInteractionValues"`を指定)。
+
+**使用例**:
+```python
+shap = clf_fi.get_feature_importance(pool_fi, type="ShapValues")
+shap_inter = clf_fi.get_feature_importance(pool_fi, type="ShapInteractionValues")
+print("ShapInteractionValues shape:", shap_inter.shape)
+
+import numpy as np
+row0_sum = shap_inter[0].sum(axis=1)
+print("通常のSHAP値[0]:", shap[0].round(4))
+print("interaction値の行和[0]:", row0_sum.round(4))
+print("ベース値の列を除いて一致するか:", np.allclose(shap[0][:-1], row0_sum[:-1], atol=1e-6))
+```
+実行結果:
+```
+ShapInteractionValues shape: (300, 7, 7)
+通常のSHAP値[0]: [ 0.184   0.1178  0.2351 -0.1464 -0.0031  1.3541 -0.0811]
+interaction値の行和[0]: [ 0.184   0.1178  0.2351 -0.1464 -0.0031  1.3541  0.    ]
+ベース値の列を除いて一致するか: True
+```
+
+**注意点・落とし穴**:
+- 戻り値の形状は`(サンプル数, 特徴量数+1, 特徴量数+1)`(`ShapValues`と同様、最後の行・列がベース値のオフセット用)。
+- 各サンプルについて「interaction行列の行方向の和」は通常の`ShapValues`と(ベース値の列を除いて)一致することを実際に確認した。つまり`ShapInteractionValues`は`ShapValues`の各特徴量寄与を、どの特徴量との交互作用によるものかにさらに分解したものになっている。
+- `(サンプル数, 特徴量数+1, 特徴量数+1)`の3次元配列は特徴量数が多いと急激にメモリを消費するため、大規模データでは`data`に一部サンプルのみの`Pool`を渡すなど注意が必要。
+
+### `.get_object_importance(...)`(学習サンプルの影響度分析)
+
+**用途**: テストデータの各予測が、学習データのどのサンプルにどれだけ強く影響されているかを求める(いわゆるinfluence functions/leave-one-out的な分析)。ノイズの多い・誤った学習データの特定に使える。
+
+**シグネチャ**: `CatBoostClassifier.get_object_importance(self, pool, train_pool, top_size=-1, type='Average', update_method='SinglePoint', importance_values_sign='All', thread_count=-1, verbose=False, ostr_type=None, log_cout=None, log_cerr=None)`
+
+**使用例**:
+```python
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from catboost import CatBoostClassifier, Pool
+
+X, y = make_classification(n_samples=300, n_features=6, n_informative=3, n_classes=2, random_state=0)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=0)
+
+clf = CatBoostClassifier(iterations=50, verbose=False, random_seed=0)
+clf.fit(Xtr, ytr)
+
+train_pool = Pool(Xtr, ytr)
+test_pool = Pool(Xte, yte)
+indices, scores = clf.get_object_importance(test_pool, train_pool, top_size=5)
+print("影響度の大きい学習サンプルのインデックス:", indices)
+print("影響度スコア:", [round(s, 4) for s in scores])
+```
+実行結果:
+```
+影響度の大きい学習サンプルのインデックス: [111, 35, 152, 122, 26]
+影響度スコア: [0.0035, 0.0028, 0.0026, -0.0023, 0.0023]
+```
+
+**注意点・落とし穴**:
+- 戻り値は`(インデックスのリスト, スコアのリスト)`のタプル。スコアの絶対値が大きい順に`top_size`件だけ返る(正負が混在し、正=予測に悪影響/負=良い影響、または逆の解釈になりうるため、`importance_values_sign`引数で符号を絞り込める)。
+- `pool`(評価対象、通常はテストデータ)と`train_pool`(影響度を測る対象の学習データ)を取り違えないよう注意。
+
+### `.virtual_ensembles_predict(...)`(予測の不確実性)
+
+**用途**: 1つのモデルから複数の仮想アンサンブル(木の集合の一部分)を切り出し、予測のばらつきから「モデル自体の不確実性(knowledge uncertainty)」と「データ由来の不確実性(data uncertainty)」を分解して推定する。
+
+**シグネチャ**: `CatBoostRegressor.virtual_ensembles_predict(self, data, prediction_type='VirtEnsembles', ntree_end=0, virtual_ensembles_count=10, thread_count=-1, verbose=None)`
+
+**使用例**:
+```python
+from sklearn.datasets import make_regression
+from sklearn.model_selection import train_test_split
+from catboost import CatBoostRegressor
+
+Xr, yr = make_regression(n_samples=300, n_features=5, noise=5.0, random_state=0)
+Xrtr, Xrte, yrtr, yrte = train_test_split(Xr, yr, test_size=0.25, random_state=0)
+
+reg = CatBoostRegressor(iterations=200, depth=4, learning_rate=0.1, verbose=False, random_seed=0,
+                         loss_function="RMSEWithUncertainty", posterior_sampling=True)
+reg.fit(Xrtr, yrtr)
+
+ve = reg.virtual_ensembles_predict(Xrte[:5], prediction_type="TotalUncertainty", virtual_ensembles_count=10)
+print(ve.round(3))
+```
+実行結果:
+```
+[[-6.57830e+01  1.92000e-01  3.57630e+01]
+ [ 1.02121e+02  5.40000e-02  6.43520e+01]
+ [ 2.32820e+01  1.28400e+00  4.04990e+01]
+ [ 1.77340e+01  2.27000e-01  1.48260e+01]
+ [ 1.88006e+02  2.16000e+00  7.88820e+01]]
+```
+
+**注意点・落とし穴**:
+- `loss_function="RMSEWithUncertainty"`と`posterior_sampling=True`をセットで指定しないと不確実性の分解ができない(通常の`"RMSE"`損失では使えない)。
+- `prediction_type="TotalUncertainty"`の戻り値は各行が「予測平均値, knowledge uncertainty(モデル由来の不確実性), data uncertainty(データ由来の不確実性)」の3列。列の意味を取り違えると誤読するので注意。
+- `virtual_ensembles_count`(既定10)は「木全体をいくつの仮想アンサンブルに分割するか」を指定する。`iterations`(この例では200)を`virtual_ensembles_count`で割り切れる必要はないが、数が少なすぎると不確実性の推定が粗くなる。
+
+---
+
+## 13. モデルの評価・比較
+
+### `catboost.utils.get_roc_curve(...)`
+
+**用途**: モデルを介さず、学習済みモデルとテストデータからROC曲線(FPR・TPR・閾値の組)を直接計算する。
+
+**シグネチャ**: `catboost.utils.get_roc_curve(model, data, thread_count=-1, plot=False)`
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from catboost import CatBoostClassifier, Pool
+from catboost.utils import get_roc_curve
+
+X, y = make_classification(n_samples=300, n_features=6, n_informative=3, n_classes=2, random_state=0)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=0)
+
+clf = CatBoostClassifier(iterations=100, verbose=False, random_seed=0)
+clf.fit(Xtr, ytr)
+test_pool = Pool(Xte, yte)
+
+fpr, tpr, thresholds = get_roc_curve(clf, test_pool)
+print("点の数:", len(fpr))
+print("fpr[:5]:", np.round(fpr[:5], 3))
+print("tpr[:5]:", np.round(tpr[:5], 3))
+```
+実行結果:
+```
+点の数: 77
+fpr[:5]: [0. 0. 0. 0. 0.]
+tpr[:5]: [0.    0.027 0.054 0.081 0.108]
+```
+
+**注意点・落とし穴**:
+- `data`には`Pool`(または`X, y`から自前で作った`Pool`)を渡す。2値分類専用で、多クラス分類のモデルに使うとエラーになる。
+- 戻り値は`(fpr, tpr, thresholds)`の3つ組で、`sklearn.metrics.roc_curve`の戻り値の順序と同じ。
+
+### `catboost.utils.get_confusion_matrix(...)` / `select_threshold(...)`
+
+**用途**: `get_confusion_matrix`は既定の閾値(0.5)での混同行列を計算する。`select_threshold`は目標のFPR(またはFNR)を満たす分類閾値を逆算する。
+
+**シグネチャ**: `catboost.utils.get_confusion_matrix(model, data, thread_count=-1)` / `catboost.utils.select_threshold(model=None, data=None, curve=None, FPR=None, FNR=None, thread_count=-1)`
+
+**使用例**:
+```python
+from catboost.utils import get_confusion_matrix, select_threshold
+
+cm = get_confusion_matrix(clf, test_pool)
+print("confusion_matrix:\n", cm)
+
+best_thr = select_threshold(clf, data=test_pool, FPR=0.05)
+print("FPR=0.05を満たす閾値:", best_thr)
+```
+実行結果:
+```
+confusion_matrix:
+ [[35.  3.]
+ [ 6. 31.]]
+FPR=0.05を満たす閾値: 0.642894118853287
+```
+
+**注意点・落とし穴**:
+- `get_confusion_matrix`は`sklearn.metrics.confusion_matrix`と異なり、既定の閾値0.5を内部で固定して計算する(閾値を変えたい場合は`select_threshold`で得た閾値を使い、自前で`predict_proba`から二値化する必要がある)。
+- `select_threshold`は`FPR`・`FNR`のどちらか一方しか指定できない(両方同時に指定すると意図通りに動かない可能性があるため、片方のみ指定するのが安全)。
+
+### `catboost.utils.get_fpr_curve(...)` / `get_fnr_curve(...)`
+
+**用途**: 分類閾値を変化させたときのFPR(偽陽性率)・FNR(偽陰性率)の推移を取得する。ROC曲線を「閾値対エラー率」の軸で見たいときに使う。
+
+**シグネチャ**: `catboost.utils.get_fpr_curve(model=None, data=None, curve=None, thread_count=-1, plot=False)` / `catboost.utils.get_fnr_curve(model=None, data=None, curve=None, thread_count=-1, plot=False)`
+
+**使用例**:
+```python
+from catboost.utils import get_fpr_curve, get_fnr_curve
+
+fpr_curve, thr_fpr = get_fpr_curve(clf, test_pool)
+fnr_curve, thr_fnr = get_fnr_curve(clf, test_pool)
+print("fpr_curveの点数:", len(fpr_curve))
+print("fnr_curveの点数:", len(fnr_curve))
+```
+実行結果:
+```
+fpr_curveの点数: 77
+fnr_curveの点数: 77
+```
+
+**注意点・落とし穴**:
+- どちらも戻り値は`(カーブの値, 対応する閾値)`の2つ組で、`get_roc_curve`で得た`(fpr, tpr, thresholds)`から`curve`引数経由で再計算させることも可能(`model`/`data`の代わりに既存の`curve`を渡す)。同じ`model`/`data`に対して`get_roc_curve`を何度も呼ぶより効率的。
+
+### `catboost.utils.compute_wx_test(...)`(モデル間の統計的比較)
+
+**用途**: 2つのモデルのサンプルごとの損失(誤差)を比較し、その差が統計的に有意かどうかをウィルコクソンの符号順位検定で判定する。「AUCが少し上がったが、それは誤差の範囲内では?」を確認するのに使える。
+
+**シグネチャ**: `catboost.utils.compute_wx_test(baseline, test)`(`baseline`/`test`はサンプルごとの損失値のリスト)
+
+**使用例**:
+```python
+import numpy as np
+from catboost.utils import compute_wx_test
+
+clf2 = CatBoostClassifier(iterations=50, depth=8, verbose=False, random_seed=0)
+clf2.fit(Xtr, ytr)
+
+proba1 = clf.predict_proba(Xte)[:, 1]
+proba2 = clf2.predict_proba(Xte)[:, 1]
+eps = 1e-15
+loss1 = -(yte * np.log(np.clip(proba1, eps, 1 - eps)) + (1 - yte) * np.log(np.clip(1 - proba1, eps, 1 - eps)))
+loss2 = -(yte * np.log(np.clip(proba2, eps, 1 - eps)) + (1 - yte) * np.log(np.clip(1 - proba2, eps, 1 - eps)))
+
+result = compute_wx_test(loss1.tolist(), loss2.tolist())
+print(result)
+```
+実行結果:
+```
+{'pvalue': 0.03699493644923635, 'wplus': 1030.0, 'wminus': 1820.0}
+```
+
+**注意点・落とし穴**:
+- `baseline`/`test`には評価指標のスコアではなく、**サンプル(行)ごとの損失値のリスト**を渡す必要がある(catboostは分類・回帰の損失を自動計算しないため、この例のようにLoglossなどを自前で算出する必要がある)。
+- `CatBoostClassifier.compare(...)`という同名のインスタンスメソッドも存在するが、実行してみたところ`ImportError: No module named 'traitlets'`となり、この検証環境(`ipywidgets`/`traitlets`未インストール)ではJupyterウィジェット依存のため動作しなかった。ノートブック環境かつ関連パッケージが入っていない場合は同様のエラーになりうるため、CLIやスクリプトからの比較には本項の`compute_wx_test`や`eval_metrics`を使う方が確実。
+
+---
+
+## 14. アンサンブル・スタッキングとの組み合わせ
+
+### `catboost.sum_models(...)`(モデルのブレンディング)
+
+**用途**: 複数の学習済みcatboostモデルを、木をそのまま結合する形で1つのモデルにブレンド(加重平均)する。再学習なしで複数モデルの予測を単一モデルとして扱いたい場合に使う。
+
+**シグネチャ**: `catboost.sum_models(models, weights=None, ctr_merge_policy='IntersectingCountersAverage')`
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.datasets import make_regression
+from sklearn.model_selection import train_test_split
+from catboost import CatBoostRegressor, sum_models
+
+Xr, yr = make_regression(n_samples=300, n_features=5, noise=5.0, random_state=0)
+Xrtr, Xrte, yrtr, yrte = train_test_split(Xr, yr, test_size=0.25, random_state=0)
+
+reg1 = CatBoostRegressor(iterations=50, depth=4, random_seed=0, verbose=False)
+reg1.fit(Xrtr, yrtr)
+reg2 = CatBoostRegressor(iterations=50, depth=6, random_seed=1, verbose=False)
+reg2.fit(Xrtr, yrtr)
+
+blended = sum_models([reg1, reg2], weights=[0.5, 0.5])
+print(type(blended))
+pred_blend = blended.predict(Xrte[:5])
+pred_manual = (reg1.predict(Xrte[:5]) + reg2.predict(Xrte[:5])) / 2
+print("ブレンド予測:", pred_blend.round(3))
+print("手動平均:", pred_manual.round(3))
+print("一致するか:", np.allclose(pred_blend, pred_manual, atol=1e-6))
+```
+実行結果:
+```
+<class 'catboost.core.CatBoost'>
+ブレンド予測: [-72.775 111.284   6.566  21.234 158.849]
+手動平均: [-72.775 111.284   6.566  21.234 158.849]
+一致するか: True
+```
+
+**注意点・落とし穴**:
+- `weights=[0.5, 0.5]`での結果は、2モデルの予測値を単純に平均した値と完全に一致することを確認した(木を連結したうえで、各木の出力に重みを掛ける形でブレンドされている)。
+- `sum_models`の戻り値は`CatBoostClassifier`/`Regressor`ではなく汎用の`CatBoost`クラス(前述「モデルの保存・読み込み」の`CatBoost`と同じ)。`.score()`メソッドを持たず(`hasattr(CatBoost, 'score')`は`False`)、分類モデルをブレンドした場合`predict()`はクラスラベルではなく生スコアを返す点に注意。
+
+### `sklearn.ensemble.StackingClassifier` との組み合わせ
+
+**用途**: catboostモデルを他のモデル(ランダムフォレストなど)と組み合わせ、それらの予測を入力として最終予測を行うメタモデル(スタッキング)を学習する。catboostはscikit-learn互換API(`fit`/`predict`/`predict_proba`)を持つため、`StackingClassifier`にそのまま渡せる。
+
+**シグネチャ**: `sklearn.ensemble.StackingClassifier(self, estimators, final_estimator=None, *, cv=None, stack_method='auto', n_jobs=None, passthrough=False, verbose=0)`
+
+**使用例**:
+```python
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import StackingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from catboost import CatBoostClassifier
+
+X, y = make_classification(n_samples=500, n_features=10, n_informative=5, n_classes=2, random_state=0)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=0)
+
+cat = CatBoostClassifier(iterations=100, verbose=False, random_seed=0)
+rf = RandomForestClassifier(n_estimators=100, random_state=0)
+
+stack = StackingClassifier(
+    estimators=[("catboost", cat), ("rf", rf)],
+    final_estimator=LogisticRegression(),
+    cv=3,
+)
+stack.fit(Xtr, ytr)
+print("StackingClassifier score:", stack.score(Xte, yte))
+
+cat_only = CatBoostClassifier(iterations=100, verbose=False, random_seed=0)
+cat_only.fit(Xtr, ytr)
+print("catboost単体 score:", cat_only.score(Xte, yte))
+```
+実行結果:
+```
+StackingClassifier score: 0.888
+catboost単体 score: 0.888
+```
+
+**注意点・落とし穴**:
+- catboostのモデルインスタンスをそのまま`estimators`に渡せる(特別なラッパーは不要)。`StackingClassifier`はクロスバリデーション(`cv=3`)で各foldごとに`cat`を複製して学習するため、内部的にはcatboostが複数回学習される点でコストが増える。
+- 今回の検証データではスタッキングによる改善は見られなかった(catboost単体と同スコア)。スタッキングが有効かどうかはデータ・ベースモデルの多様性に依存するため、必ず単体モデルとの比較検証が必要。
+
+### `sklearn.ensemble.VotingClassifier` との組み合わせ
+
+**用途**: catboostと他のモデルの予測確率を平均する、より単純なアンサンブル手法(ソフト投票)。スタッキングよりシンプルで過学習しにくい。
+
+**シグネチャ**: `sklearn.ensemble.VotingClassifier(self, estimators, *, voting='hard', weights=None, n_jobs=None, flatten_transform=True, verbose=False)`
+
+**使用例**:
+```python
+from sklearn.ensemble import VotingClassifier
+
+vote = VotingClassifier(estimators=[("catboost", cat), ("rf", rf)], voting="soft")
+vote.fit(Xtr, ytr)
+print("VotingClassifier(soft) score:", vote.score(Xte, yte))
+```
+実行結果:
+```
+VotingClassifier(soft) score: 0.88
+```
+
+**注意点・落とし穴**:
+- `voting="soft"`を使うには、`estimators`に含める全モデルが`predict_proba`を持っている必要がある(catboostの`CatBoostClassifier`は対応済み)。
+- `voting="hard"`(多数決)は`predict_proba`不要だが、モデル数が偶数だと同数決になりうる点に注意(今回は2モデルなので特に`soft`が無難)。

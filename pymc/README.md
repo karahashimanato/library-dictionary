@@ -13,6 +13,13 @@ PyMC 6.3.1 で検証済み。すべてのシグネチャ・実行結果は `/hom
 7. [診断・モデル比較(ArviZ)](#7-診断モデル比較arviz)
 8. [階層モデル・座標系(coords/dims)](#8-階層モデル座標系coordsdims)
 9. [その他ユーティリティ](#9-その他ユーティリティ)
+10. [応用・発展](#10-応用発展)
+    - 10-1. [カスタム分布・特殊な分布ラッパー](#10-1-カスタム分布特殊な分布ラッパー)
+    - 10-2. [ガウス過程(pm.gp)](#10-2-ガウス過程pmgp)
+    - 10-3. [時系列モデル](#10-3-時系列モデル)
+    - 10-4. [逐次モンテカルロ(SMC)](#10-4-逐次モンテカルロsmc)
+    - 10-5. [欠損データ・並列サンプリング設定](#10-5-欠損データ並列サンプリング設定)
+    - 10-6. [事前分布設計ユーティリティ](#10-6-事前分布設計ユーティリティ)
 
 ---
 
@@ -805,3 +812,517 @@ b   2.34   0.33      1.8      2.9      800      618  1.00     0.012  0.0088
 **注意点・落とし穴**:
 - `pm.math.invlogit(a + b*x)`のように線形結合をシグモイド変換して`Bernoulli(p=...)`に渡す代わりに、`Bernoulli(logit_p=a + b*x)`と書くこともできる(2章参照)。後者の方が内部の数値計算(log-sum-expなど)が安定するため、実務では`logit_p`を使う方が無難なことが多い。
 - `pymc.math`は基本的に`pytensor.tensor`の関数の再エクスポートであり、NumPyの関数(`np.log`など)をPyTensorの確率変数にそのまま使うとエラーになる場合、対応する`pymc.math`(`pm.math.log`等)に置き換える。
+
+---
+
+## 10. 応用・発展
+
+### 10-1. カスタム分布・特殊な分布ラッパー
+
+#### `CustomDist(...)`
+
+**用途**: 組み込みの分布にない任意の尤度(`logp`)や生成過程(`dist`/`random`)を自作し、通常の分布と同じようにモデルへ組み込む。
+
+**シグネチャ**: `pymc.CustomDist(name, *dist_params, dist=None, random=None, logp=None, logcdf=None, support_point=None, ndim_supp=None, ndims_params=None, signature=None, dtype='floatX', **kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+import pymc as pm
+import arviz as az
+
+rng = np.random.default_rng(0)
+y_obs = rng.normal(loc=3.0, scale=1.5, size=60)
+
+def logp_custom(value, mu, sigma):
+    # 中身はNormalの対数尤度だが、任意の対数尤度式に置き換えられる
+    return pm.logp(pm.Normal.dist(mu, sigma), value)
+
+with pm.Model() as m:
+    mu = pm.Normal("mu", 0, 10)
+    sigma = pm.HalfNormal("sigma", 5)
+    y = pm.CustomDist("y", mu, sigma, logp=logp_custom, observed=y_obs)
+    idata = pm.sample(draws=500, tune=500, chains=2, random_seed=0, progressbar=False)
+
+print(az.summary(idata, var_names=["mu", "sigma"]))
+```
+実行結果:
+```
+Initializing NUTS using jitter+adapt_diag...
+Multiprocess sampling (2 chains in 2 jobs)
+NUTS: [mu, sigma]
+Sampling 2 chains for 500 tune and 500 draw iterations (1_000 + 1_000 draws total) took 2 seconds.
+We recommend running at least 4 chains for robust computation of convergence diagnostics
+        mean     sd eti89_lb eti89_ub ess_bulk ess_tail r_hat mcse_mean mcse_sd
+mu       3.1    0.2      2.8      3.4      842      529  1.00    0.0073  0.0062
+sigma  1.394  0.136      1.2      1.6     1025      753  1.00    0.0044  0.0037
+```
+
+**注意点・落とし穴**:
+- **実測で確認した落とし穴**: `logp`だけを渡して`dist`/`random`を渡さない場合、MCMCサンプリング(`observed`ありの尤度評価)は問題なく動くが、`pm.sample_prior_predictive()`のようにこの変数から乱数生成しようとすると`NotImplementedError: Attempted to run random on the CustomDist '...', but this method had not been provided when the distribution was constructed.`になる。事前予測チェックまで行いたい場合は`random`(または`dist`)も併せて実装する必要がある。
+- `logp`関数の第一引数は必ず`value`(観測値またはサンプル値)で、以降の引数が`*dist_params`で渡したパラメータ(ここでは`mu, sigma`)に対応する。
+
+#### `Truncated(...)`
+
+**用途**: 既存の任意の分布を「指定範囲内だけの値を取るように」切り詰める(密度を範囲内で再正規化する)。
+
+**シグネチャ**: `pymc.Truncated.dist(dist, lower=None, upper=None, max_n_steps=10000, **kwargs)`
+
+**使用例**:
+```python
+import pymc as pm
+
+base = pm.Normal.dist(mu=0, sigma=1)
+trunc = pm.Truncated.dist(base, lower=0, upper=None)
+print(pm.draw(trunc, draws=10, random_seed=0))
+```
+実行結果:
+```
+[1.90283218 0.40746997 1.08559681 0.158076   0.55773751 0.93079058
+ 0.07109423 1.33742802 0.3433924  0.99291241]
+```
+
+**注意点・落とし穴**:
+- 第一引数`dist`には`pm.Normal.dist(...)`のような「まだモデルに登録していない」分布オブジェクトを渡す(3章の`pm.Normal("mu", ...)`のようなモデル登録済み変数ではない)。
+- 次項の`Censored`と混同しやすいが、`Truncated`は範囲外の確率密度自体を捨てて範囲内で再正規化するため、生成される値は必ず`lower`〜`upper`に収まり、境界に点質量は生じない。
+
+#### `Censored(...)`
+
+**用途**: 既存の分布からサンプリングした後、範囲外の値を境界値に切り詰める(打ち切り観測をモデル化する。例: センサーの測定上限)。
+
+**シグネチャ**: `pymc.Censored.dist(dist, lower=-inf, upper=inf, **kwargs)`
+
+**使用例**:
+```python
+base2 = pm.Normal.dist(mu=0, sigma=1)
+cens = pm.Censored.dist(base2, lower=-1, upper=1)
+print(pm.draw(cens, draws=10, random_seed=0))
+```
+実行結果:
+```
+[ 1.         -0.89594598  0.73595567  0.00587704  0.85338179  0.16094803
+  0.81931469  0.80565568  0.21756732  0.97007874]
+```
+
+**注意点・落とし穴**:
+- **実測で確認した落とし穴**: `Truncated`と同じ乱数シードで比較すると挙動の違いがよくわかる。元の`Normal.dist(0, 1)`の1つ目のサンプルは`1.4437`だが、`Censored(lower=-1, upper=1)`では上限`1`にクリップされてちょうど`1.0`になっている(`Truncated`ならこの値自体が生成されない)。`Censored`は境界に点質量(確率の塊)を作るが、`Truncated`は境界に到達しない連続分布のままという違いがある。
+- 用途に応じて使い分ける: 測定機器の上限/下限で観測値が丸められる(打ち切り)なら`Censored`、そもそも範囲外の値が物理的に存在しえない(切断)なら`Truncated`が適切。
+
+#### `Mixture(...)`
+
+**用途**: 複数の分布を重み付きで混合した分布(例: 2つの正規分布からなる二峰性データ)をモデル化する。
+
+**シグネチャ**: `pymc.Mixture.dist(w, comp_dists, **kwargs)`
+
+**使用例**:
+```python
+w = [0.3, 0.7]
+comp_dists = [pm.Normal.dist(mu=-3, sigma=1), pm.Normal.dist(mu=3, sigma=1)]
+mix = pm.Mixture.dist(w=w, comp_dists=comp_dists)
+print(pm.draw(mix, draws=10, random_seed=0))
+```
+実行結果:
+```
+[ 4.44369095 -4.91205922  3.73595567  3.00587704 -1.70636569  3.16094803
+  3.81931469  3.80565568  3.21756732 -2.24800945]
+```
+
+**注意点・落とし穴**:
+- `w`(各コンポーネントの重み)は合計1になる必要があり、`comp_dists`のリストの長さと一致していなければならない。
+- 出力を見ると生成値のほとんどが`mu=3`側(重み0.7)に偏っている。モデル内で`w`自体を`pm.Dirichlet`の事前分布を持つ確率変数にすれば、混合比率も一緒に推定できる。
+
+#### `MvNormal(...)`
+
+**用途**: 多変量正規分布。複数の確率変数間の相関を明示的にモデル化する(例: 複数指標の同時分布、相関のある回帰係数)。
+
+**シグネチャ**: `pymc.MvNormal.dist(mu=0, cov=None, *, tau=None, chol=None, lower=True, **kwargs)`
+
+**使用例**:
+```python
+mu = [0, 0]
+cov = [[1.0, 0.7], [0.7, 1.0]]
+mv = pm.MvNormal.dist(mu=mu, cov=cov)
+print(pm.draw(mv, draws=5, random_seed=0))
+```
+実行結果:
+```
+[[1.44369095 0.37075026]
+ [0.73595567 0.51936602]
+ [0.85338179 0.71230714]
+ [0.81931469 1.14887352]
+ [0.21756732 0.84507191]]
+```
+
+**注意点・落とし穴**:
+- 共分散行列は`cov`(共分散)・`tau`(精度行列)・`chol`(コレスキー分解)のいずれか1つで指定する。サンプリングの数値安定性・速度の観点では、モデル内で`chol`を`pm.LKJCholeskyCov`などから構築して渡す方が、生の`cov`を直接渡すより好まれる。
+- 戻り値の各行が1サンプル(2次元ベクトル)になっており、`draws=5`の結果は`(5, 2)`の配列になる(1次元分布の`pm.draw`とは形状の次元数が異なる)。
+
+### 10-2. ガウス過程(pm.gp)
+
+#### `pm.gp.cov.ExpQuad(...)`
+
+**用途**: ガウス過程(GP)の共分散関数(カーネル)のうち最も基本的なもの。2点間の距離が近いほど強く相関する滑らかな関数を表現する。
+
+**シグネチャ**: `pymc.gp.cov.ExpQuad(input_dim: int, ls=None, ls_inv=None, active_dims=None)`
+
+**使用例**:
+```python
+import numpy as np
+import pymc as pm
+
+X = np.array([[0.0], [1.0], [2.0]])
+cov_func = 2.0 ** 2 * pm.gp.cov.ExpQuad(input_dim=1, ls=1.0)
+K = cov_func(X).eval()
+print(K)
+```
+実行結果:
+```
+[[4.         2.42612264 0.54134113]
+ [2.42612264 4.         2.42612264]
+ [0.54134113 2.42612264 4.        ]]
+```
+
+**注意点・落とし穴**:
+- `ls`(lengthscale)が長いほど遠くの点同士の相関が強く保たれ(なめらかな関数)、短いほど相関が急速に減衰する(ギザギザした関数)。`eta**2 * ExpQuad(...)`のように分散スケール(`eta`)を掛けて使うのが定石で、対角成分(自己共分散)が`eta**2`になる(上の例では`2.0**2=4.0`)。
+- `input_dim`は入力`X`の列数(特徴量の次元数)と一致させる必要がある。`cov_func(X)`はPyTensorの計算グラフを返すだけなので、具体的な数値を見るには`.eval()`が必要。
+
+#### `pm.gp.Marginal(...)` と `.marginal_likelihood(...)`
+
+**用途**: 観測ノイズが正規分布であるガウス過程回帰を、GPの関数値自体をサンプリングせずに周辺化(積分消去)した尤度で効率よく推定する。
+
+**シグネチャ**: `pymc.gp.Marginal(*, mean_func=Zero(), cov_func=Constant())`、`Marginal.marginal_likelihood(self, name, X, y, sigma, jitter=1e-06, is_observed=True, **kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+import pymc as pm
+import arviz as az
+
+rng = np.random.default_rng(0)
+X = np.linspace(0, 10, 20)[:, None]
+y = np.sin(X[:, 0]) + rng.normal(scale=0.2, size=20)
+
+with pm.Model() as gp_model:
+    ell = pm.HalfNormal("ell", sigma=2)
+    eta = pm.HalfNormal("eta", sigma=2)
+    cov_func = eta ** 2 * pm.gp.cov.ExpQuad(1, ls=ell)
+    gp = pm.gp.Marginal(cov_func=cov_func)
+    sigma = pm.HalfNormal("sigma", sigma=1)
+    y_ = gp.marginal_likelihood("y", X=X, y=y, sigma=sigma)
+    idata = pm.sample(draws=300, tune=300, chains=2, random_seed=0, progressbar=False, target_accept=0.9)
+
+print(az.summary(idata, var_names=["ell", "eta", "sigma"]))
+```
+実行結果:
+```
+Initializing NUTS using jitter+adapt_diag...
+Multiprocess sampling (2 chains in 2 jobs)
+NUTS: [ell, eta, sigma]
+Sampling 2 chains for 300 tune and 300 draw iterations (600 + 600 draws total) took 141 seconds.
+We recommend running at least 4 chains for robust computation of convergence diagnostics
+        mean     sd eti89_lb eti89_ub ess_bulk ess_tail r_hat mcse_mean mcse_sd
+ell     1.66   0.43     0.97      2.3      203      344  1.00      0.03   0.019
+eta     1.09   0.46     0.57      1.9      236      235  1.00     0.034   0.036
+sigma  0.162  0.041     0.11     0.24      332      319  1.00    0.0022  0.0022
+```
+
+**注意点・落とし穴**:
+- **実測で確認した落とし穴**: `gp.Marginal`は内部で観測点数×観測点数の共分散行列のコレスキー分解を毎イテレーション計算するため、他章の単純な`Normal`モデルに比べて極端に遅い。上の例は観測点がわずか20点、`draws=300, tune=300, chains=2`という小規模設定でも実測141秒かかった(観測点数が増えると計算量は3乗で増大する)。データ数が多い場合は`pm.gp.MarginalApprox`や`pm.gp.HSGP`(Hilbert空間近似)などのスケーラブルな実装を検討する必要がある。
+- `sigma`(観測ノイズの標準偏差)は`marginal_likelihood`の引数として渡し、GP自体の事前分布(`mean_func`/`cov_func`)とは別に指定する。
+
+#### `Marginal.conditional(...)`(新しい入力点での予測)
+
+**用途**: `marginal_likelihood`で学習したGPを使って、未観測の新しい入力点における関数値の事後予測分布を得る。
+
+**シグネチャ**: `Marginal.conditional(self, name, Xnew, pred_noise=False, given=None, jitter=1e-06, **kwargs)`
+
+**使用例**:
+```python
+Xnew = np.array([[10.5], [11.0]])
+with gp_model:
+    mu_pred = gp.conditional("mu_pred", Xnew)
+    pred = pm.sample_posterior_predictive(idata, var_names=["mu_pred"], random_seed=0, progressbar=False)
+print(pred.posterior_predictive["mu_pred"].mean(dim=["chain", "draw"]).values)
+```
+実行結果:
+```
+Sampling: [mu_pred]
+[-0.50724903 -0.56592083]
+```
+
+**注意点・落とし穴**:
+- `gp.conditional(...)`は学習済みの`gp_model`コンテキスト内で呼ぶ必要がある(元のモデルと同じ`with`ブロック、または`model=`引数で明示的に紐付ける)。呼び出すと新しい変数がモデルに追加されるだけなので、実際の予測値を得るには続けて`pm.sample_posterior_predictive`を呼ぶ。
+- `pred_noise=False`(デフォルト)では観測ノイズ`sigma`を含まない「真の関数値」の予測になる。観測値そのものの予測区間(ノイズ込み)が欲しい場合は`pred_noise=True`を指定する。
+
+#### `pm.gp.Latent(...)`
+
+**用途**: 観測ノイズが正規分布ではない場合(例: ポアソン尤度のカウントデータ)にガウス過程を使う。GPの関数値そのものを潜在変数としてMCMCでサンプリングする。
+
+**シグネチャ**: `pymc.gp.Latent(*, mean_func=Zero(), cov_func=Constant())`、`Latent.prior(self, name, X, n_outputs=1, reparameterize=True, jitter=1e-06, **kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+import pymc as pm
+import arviz as az
+
+rng = np.random.default_rng(0)
+X = np.linspace(0, 10, 10)[:, None]
+f_true = np.sin(X[:, 0])
+y = rng.poisson(np.exp(0.5 * f_true))
+
+with pm.Model() as latent_model:
+    ell = pm.HalfNormal("ell", sigma=2)
+    cov_func = pm.gp.cov.ExpQuad(1, ls=ell)
+    gp = pm.gp.Latent(cov_func=cov_func)
+    f = gp.prior("f", X=X)
+    y_obs = pm.Poisson("y_obs", mu=pm.math.exp(0.5 * f), observed=y)
+    idata = pm.sample(draws=150, tune=150, chains=2, random_seed=0, progressbar=False, target_accept=0.9)
+
+print(type(f))
+print(az.summary(idata, var_names=["ell"]))
+```
+実行結果:
+```
+Initializing NUTS using jitter+adapt_diag...
+Multiprocess sampling (2 chains in 2 jobs)
+NUTS: [ell, f_rotated_]
+Sampling 2 chains for 150 tune and 150 draw iterations (300 + 300 draws total) took 125 seconds.
+There was 1 divergence after tuning. Increase `target_accept` or reparameterize.
+We recommend running at least 4 chains for robust computation of convergence diagnostics
+The rhat statistic is larger than 1.01 for some parameters. This indicates problems during sampling. See https://arxiv.org/abs/1903.08008 for details
+<class 'pytensor.tensor.variable.TensorVariable'>
+    mean   sd eti89_lb eti89_ub ess_bulk ess_tail r_hat mcse_mean mcse_sd
+ell  1.4  1.2     0.12      3.7      253      224  1.00     0.069   0.057
+```
+
+**注意点・落とし穴**:
+- **実測で確認した落とし穴**: `NUTS: [ell, f_rotated_]`のログの通り、内部では`f`そのものではなく`reparameterize=True`(デフォルト)による非中心化パラメータ化`f_rotated_`がサンプリングされる(収束を改善するための標準的なテクニック)。`az.summary`で`f`自体の要約も見たい場合は`var_names=["f"]`のように明示すれば`Deterministic`経由で復元された値が参照できる。
+- `pm.gp.Marginal`と異なりガウス尤度を仮定しないため任意の観測分布(ここでは`Poisson`)と組み合わせられるが、その分`f`(観測点数と同じ次元を持つ高次元の潜在変数)を直接NUTSでサンプリングすることになり、上の例のようにダイバージェンスが出やすく計算コストも高い。観測点数がわずか10点、`draws=150, tune=150`という小規模設定でも125秒かかった。
+
+### 10-3. 時系列モデル
+
+#### `AR(...)`
+
+**用途**: 自己回帰(AR)過程。時点`t`の値が過去`p`時点の値の線形結合とノイズで決まる時系列データをモデル化する。
+
+**シグネチャ**: `pymc.AR(name, rho, *args, steps=None, constant=False, ar_order=None, **kwargs)`(`.dist`版: `pymc.AR.dist(rho, sigma=None, tau=None, *, init_dist=None, steps=None, constant=False, ar_order=None, **kwargs)`)
+
+**使用例**:
+```python
+import numpy as np
+import pymc as pm
+import arviz as az
+
+rng = np.random.default_rng(0)
+n = 100
+true_rho = 0.7
+y = np.zeros(n)
+for t in range(1, n):
+    y[t] = true_rho * y[t - 1] + rng.normal(scale=1.0)
+
+with pm.Model() as ar_model:
+    rho = pm.Normal("rho", mu=0, sigma=1)
+    sigma = pm.HalfNormal("sigma", sigma=1)
+    ar = pm.AR("ar", rho=rho, sigma=sigma, init_dist=pm.Normal.dist(0, 1), observed=y)
+    idata = pm.sample(draws=300, tune=300, chains=2, random_seed=0, progressbar=False)
+
+print(az.summary(idata, var_names=["rho", "sigma"]))
+```
+実行結果:
+```
+Initializing NUTS using jitter+adapt_diag...
+Multiprocess sampling (2 chains in 2 jobs)
+NUTS: [rho, sigma]
+Sampling 2 chains for 300 tune and 300 draw iterations (600 + 600 draws total) took 1 seconds.
+We recommend running at least 4 chains for robust computation of convergence diagnostics
+        mean     sd eti89_lb eti89_ub ess_bulk ess_tail r_hat mcse_mean mcse_sd
+rho     0.76  0.066     0.66     0.87      392      410  1.01    0.0032  0.0021
+sigma  0.965  0.075     0.86      1.1      586      478  1.00    0.0031  0.0026
+```
+(真の`rho=0.7`に対し`0.76`程度と近い値が推定できている)
+
+**注意点・落とし穴**:
+- `rho`をスカラーの確率変数(単一の`pm.Normal`)として渡すとAR(1)になる。`rho`を長さ`p`のベクトル(または`shape=p`の分布)にして`ar_order=p`を指定すると、そのままAR(p)(p次の自己回帰)として扱える。
+- `init_dist`(過程の最初の値の分布)を省略すると`UserWarning`とともに`Normal.dist(0, 100)`が自動的に使われる。過程の初期値についてある程度の知識がある場合は明示的に指定した方がよい。
+
+#### `GaussianRandomWalk(...)`
+
+**用途**: ガウシアン・ランダムウォーク。各時点の増分が正規分布に従う(自己回帰係数が常に1の特殊なAR)非定常な時系列の潜在トレンドなどに使う。
+
+**シグネチャ**: `pymc.GaussianRandomWalk.dist(mu=0.0, sigma=1.0, *, init_dist=None, steps=None, **kwargs)`
+
+**使用例**:
+```python
+import pymc as pm
+
+grw = pm.GaussianRandomWalk.dist(mu=0, sigma=1, init_dist=pm.Normal.dist(0, 1), steps=5)
+print(pm.draw(grw, draws=3, random_seed=0))
+```
+実行結果:
+```
+[[ 0.80508947  2.24878043  1.35283445  2.08879012  2.09466716  2.94804895]
+ [-1.91205922 -1.75111118 -0.93179649 -0.12614081  0.09142651  1.06150525]
+ [-3.49664925 -4.23576231 -3.64228438 -4.35774738 -5.11140475 -3.79773521]]
+```
+
+**注意点・落とし穴**:
+- **実測で確認した落とし穴**: `steps=5`を指定すると、出力される系列の長さは`steps`ではなく`steps + 1`(=6)になる(`init_dist`による初期値1点 + その後の5ステップの増分)。系列長を`n`にしたい場合は`steps=n-1`を指定する必要がある。
+- `AR`の特殊ケース(`rho=1`固定)に相当し、単調に分散が増加していく(平均から離れやすくなる)非定常過程。株価やセンサー値の緩やかなトレンド成分のモデリングによく使われる。
+
+### 10-4. 逐次モンテカルロ(SMC)
+
+#### `sample_smc(...)`
+
+**用途**: NUTSが苦手とする多峰性の強い事後分布や、離散変数を含むモデルにも比較的頑健な、逐次モンテカルロ(Sequential Monte Carlo)法でサンプリングする。
+
+**シグネチャ**: `pymc.sample_smc(draws=2000, kernel=IMH, *, start=None, model=None, random_seed=None, chains=None, cores=None, blas_cores=None, compute_convergence_checks=True, return_inferencedata=True, idata_kwargs=None, progressbar=True, progressbar_theme=None, backend=None, compile_kwargs=None, mp_ctx=None, **kernel_kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+import pymc as pm
+import arviz as az
+
+rng = np.random.default_rng(0)
+y = rng.normal(loc=2.0, scale=1.0, size=50)
+
+with pm.Model() as smc_model:
+    mu = pm.Normal("mu", 0, 10)
+    sigma = pm.HalfNormal("sigma", 5)
+    obs = pm.Normal("obs", mu=mu, sigma=sigma, observed=y)
+    idata_smc = pm.sample_smc(draws=500, chains=2, random_seed=0, progressbar=False)
+
+print(az.summary(idata_smc, var_names=["mu", "sigma"]))
+```
+実行結果:
+```
+Initializing SMC sampler...
+Sampling 2 chains in 2 jobs
+We recommend running at least 4 chains for robust computation of convergence diagnostics
+        mean     sd eti89_lb eti89_ub ess_bulk ess_tail r_hat mcse_mean mcse_sd
+mu     2.126   0.13      1.9      2.3      948      925  1.00    0.0042  0.0032
+sigma  0.946  0.099      0.8      1.1      973      834  1.00    0.0032  0.0024
+```
+
+**注意点・落とし穴**:
+- `pm.sample()`(NUTS)とは異なる独立したサンプラーで、`draws`はNUTSの`tune`に相当する概念がなく、各世代でリサンプリング・重み付けを繰り返しながら事後分布に近づけていく(「chains」はSMCでは並列に動かす独立したパーティクル集団の数という意味合いが強い)。
+- 戻り値の`idata_smc`には`log_likelihood`ではなく`sample_stats`グループにSMC特有の統計量(受理率など)が入る。通常のNUTSの結果と同じく`az.summary`や`az.plot_trace`はそのまま使えるが、`compute_log_likelihood`や`r_hat`の解釈はNUTSの場合と前提が異なる点に留意。
+
+### 10-5. 欠損データ・並列サンプリング設定
+
+#### 欠損データの自動インピュテーション(マスク配列)
+
+**用途**: 観測データの一部が欠損している場合、`numpy.ma.masked_array`(またはNaNを含む配列)を`observed`にそのまま渡すだけで、PyMCが欠損値を自動的に未知パラメータとして扱いMCMCで補完(インピュテーション)する。
+
+**シグネチャ**: 専用の関数はなく、`observed=`引数に`numpy.ma.MaskedArray`(または`pandas`のNaNを含むSeries/DataFrame)を渡す運用パターン。
+
+**使用例**:
+```python
+import numpy as np
+import numpy.ma as ma
+import pymc as pm
+import arviz as az
+
+rng = np.random.default_rng(0)
+y = rng.normal(loc=5.0, scale=2.0, size=20)
+y_missing = y.copy()
+y_missing[[3, 7, 15]] = np.nan
+y_masked = ma.masked_invalid(y_missing)
+
+with pm.Model() as impute_model:
+    mu = pm.Normal("mu", 0, 10)
+    sigma = pm.HalfNormal("sigma", 5)
+    obs = pm.Normal("obs", mu=mu, sigma=sigma, observed=y_masked)
+    print(sorted(impute_model.named_vars.keys()))
+    idata = pm.sample(draws=300, tune=300, chains=2, random_seed=0, progressbar=False)
+
+print(az.summary(idata, var_names=["obs_unobserved"]))
+```
+実行結果:
+```
+.../pymc/model/core.py:2061: ImputationWarning: Data in obs contains missing values and will be automatically imputed from the sampling distribution.
+  warnings.warn(impute_message, ImputationWarning)
+Initializing NUTS using jitter+adapt_diag...
+Multiprocess sampling (2 chains in 2 jobs)
+NUTS: [mu, sigma, obs_unobserved]
+['mu', 'obs', 'obs_observed', 'obs_unobserved', 'sigma']
+Sampling 2 chains for 300 tune and 300 draw iterations (600 + 600 draws total) took 0 seconds.
+We recommend running at least 4 chains for robust computation of convergence diagnostics
+                  mean   sd eti89_lb eti89_ub ess_bulk ess_tail r_hat mcse_mean mcse_sd
+obs_unobserved[0]  4.5  2.1      1.3      7.9      791      479  1.00     0.073   0.053
+obs_unobserved[1]  4.5    2      1.5      7.7      644      432  1.00     0.078    0.06
+obs_unobserved[2]  4.5  2.2     0.92      7.9      600      383  1.00     0.091   0.077
+```
+
+**注意点・落とし穴**:
+- **実測で確認した落とし穴**: マスクされた要素があると、元の`obs`という1つの確率変数が内部的に`obs_observed`(観測済みの値、定数)と`obs_unobserved`(欠損値、事後分布からサンプリングされる確率変数)の2つに自動分割される(`impute_model.named_vars`で確認可能)。`az.summary(idata, var_names=["obs"])`のように元の名前では欠損値の推定結果にアクセスできないので、`obs_unobserved`という名前を使う必要がある。
+- `ImputationWarning`が出るのは仕様どおりの動作であり、エラーではない。ただし意図せずNaNが混入したデータをそのまま渡すと気づかずに欠損値補完が走ってしまうことがあるため、警告文は無視せず確認する習慣が重要。
+
+#### `cores`/`chains`引数の挙動
+
+**用途**: `pm.sample()`の`chains`(独立に走らせるMCMCチェーンの本数)と`cores`(実際に同時実行する並列プロセス数)の関係を理解し、意図通りの並列度でサンプリングする。
+
+**シグネチャ**: `pymc.sample(..., chains=None, cores=None, ...)`(`chains`のデフォルトはNoneで内部的に2以上に、`cores`のデフォルトはNoneで`min(利用可能CPUコア数, chains)`に自動決定される)
+
+**使用例**:
+```python
+import numpy as np
+import pymc as pm
+
+rng = np.random.default_rng(0)
+y = rng.normal(loc=0, scale=1, size=20)
+
+with pm.Model() as m:
+    mu = pm.Normal("mu", 0, 10)
+    obs = pm.Normal("obs", mu=mu, sigma=1, observed=y)
+    idata_default = pm.sample(draws=200, tune=200, chains=4, random_seed=0, progressbar=False)
+
+with m:
+    idata_seq = pm.sample(draws=200, tune=200, chains=4, cores=1, random_seed=0, progressbar=False)
+```
+実行結果(標準出力ログ、環境は16コアCPU):
+```
+# cores省略(デフォルト)の場合
+Multiprocess sampling (4 chains in 4 jobs)
+
+# cores=1を明示した場合
+Sequential sampling (4 chains in 1 job)
+```
+
+**注意点・落とし穴**:
+- **実測で確認した落とし穴**: `cores`を省略した場合、実行環境のCPUコア数(この検証環境では16)と`chains`の小さい方が使われ、`chains`本のチェーンがすべて別プロセスで同時に(マルチプロセスで)実行される。`cores=1`を明示すると、たとえ`chains=4`でも1プロセスずつ順番に(シーケンシャルに)実行される(ログの`Multiprocess sampling`↔`Sequential sampling`の違いで確認できる)。
+- いずれの場合も結果の`idata.posterior`の形状(`chain`次元の長さ)は`chains`の値そのものであり、`cores`は計算の並列度(実行時間)にのみ影響し結果の統計的な意味には影響しない。ただしJupyter上で対話的に実行する場合、マルチプロセス実行(`cores>1`)はプラットフォームによってはpickle化の問題で失敗することがあり、その場合は`cores=1`で回避できる。
+
+### 10-6. 事前分布設計ユーティリティ
+
+#### `find_constrained_prior(...)`
+
+**用途**: 「値は`lower`〜`upper`の範囲にだいたい`mass`(例: 90%)の確率で収まってほしい」という制約から、指定した分布族(例: `Gamma`)のパラメータを数値的に逆算する。事前分布の形を勘ではなくデータ的な制約から決めたい場合に使う。
+
+**シグネチャ**: `pymc.find_constrained_prior(distribution, lower, upper, init_guess, mass=0.95, fixed_params=None, mass_below_lower=None, **kwargs)`
+
+**使用例**:
+```python
+import pymc as pm
+from scipy import stats
+
+params = pm.find_constrained_prior(
+    pm.Gamma, lower=1, upper=10, mass=0.9, init_guess={"alpha": 2, "beta": 0.5}
+)
+print(params)
+
+alpha, beta = params["alpha"], params["beta"]
+mass = stats.gamma(a=alpha, scale=1 / beta).cdf(10) - stats.gamma(a=alpha, scale=1 / beta).cdf(1)
+print("mass in [1,10]:", mass)
+```
+実行結果:
+```
+<stdin>:3: FutureWarning: find_constrained_prior is deprecated and will be removed in a future version. Please use maxent function from PreliZ. https://preliz.readthedocs.io/en/latest/api_reference.html#preliz.unidimensional.maxent
+{'alpha': np.float64(2.437273357641224), 'beta': np.float64(0.543787295811397)}
+mass in [1,10]: 0.8999999998542045
+```
+
+**注意点・落とし穴**:
+- **バージョン固有の注意(実測で確認)**: PyMC 6.3.1では`find_constrained_prior`は**非推奨(`FutureWarning`)**であり、将来のバージョンで削除予定。メッセージが案内する通り、姉妹ライブラリ[PreliZ](https://preliz.readthedocs.io/)の`maxent`関数への移行が推奨されている。新規にコードを書く場合はPreliZの導入を検討した方がよい。
+- 非推奨ではあるものの、`scipy.stats`で実測したとおり計算結果自体は正しく、返された`alpha`/`beta`のガンマ分布は`[1, 10]`の区間にちょうど`mass=0.9`(90%)の確率質量を持つ。`init_guess`(数値最適化の初期値)は指定した`distribution`が要求するパラメータ名の辞書で与える必要がある。

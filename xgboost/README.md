@@ -14,6 +14,14 @@ xgboost 3.4.1 で検証済み。すべてのシグネチャ・実行結果は `/
 8. [ハイパーパラメータ・目的関数](#8-ハイパーパラメータ目的関数)
 9. [その他ユーティリティ](#9-その他ユーティリティ)
 
+## 応用・発展
+
+10. [カスタム目的関数・カスタム評価関数](#10-カスタム目的関数カスタム評価関数)
+11. [単調性制約・特徴量間相互作用制約](#11-単調性制約特徴量間相互作用制約)
+12. [SHAP値の深掘り](#12-shap値の深掘り)
+13. [ハイパーパラメータチューニングの実践パターン](#13-ハイパーパラメータチューニングの実践パターン)
+14. [特殊なタスク・モデル診断の応用](#14-特殊なタスクモデル診断の応用)
+
 ---
 
 ## 1. DMatrix・学習基礎
@@ -827,3 +835,534 @@ print(clf_gp.get_params()["max_depth"])
 ## 補足: 検証に使ったデータセット
 
 上記の実行結果はscikit-learnの`load_iris`/`load_breast_cancer`/`make_classification`/`make_regression`で生成した練習用データに対する実測値であり、`random_state`固定でも将来のxgboost/scikit-learnのバージョン変更で数値が変わりうる。
+
+---
+
+## 応用・発展
+
+以下はCPU環境(GPUなし)で実際に実行して検証した、より発展的・ニッチなAPI。GPU専用機能(`device="cuda"`でのみ意味を持つ設定など)は、この環境では実行結果を確認できないため含めていない。
+
+## 10. カスタム目的関数・カスタム評価関数
+
+### `obj=` / `custom_metric=`(`xgboost.train`)
+
+**用途**: 組み込みの`objective`/`eval_metric`では表現できない独自の損失関数・評価指標を使う。低レベルAPI(`xgb.train`)に、勾配・ヘシアンを返す関数(`obj`)や評価値を返す関数(`custom_metric`)を渡す。
+
+**シグネチャ**: `obj: Callable[[np.ndarray, DMatrix], Tuple[np.ndarray, np.ndarray]]`(予測値とDMatrixを受け取り`(grad, hess)`を返す)/ `custom_metric: Callable[[np.ndarray, DMatrix], Tuple[str, float]]`(予測値とDMatrixを受け取り`(名前, スコア)`を返す)。どちらも`xgboost.train(params, dtrain, ..., obj=None, ..., custom_metric=None)`のキーワード引数(1章の`xgb.train`シグネチャ参照)。
+
+**使用例**:
+```python
+import numpy as np
+import xgboost as xgb
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+data = load_breast_cancer()
+Xtr, Xte, ytr, yte = train_test_split(data.data, data.target, test_size=0.2, random_state=0, stratify=data.target)
+dtrain = xgb.DMatrix(Xtr, label=ytr)
+dtest = xgb.DMatrix(Xte, label=yte)
+
+def logregobj(preds, dtrain):
+    labels = dtrain.get_label()
+    p = 1.0 / (1.0 + np.exp(-preds))     # binary:logisticを手動で再実装
+    grad = p - labels
+    hess = p * (1.0 - p)
+    return grad, hess
+
+def custom_error(preds, dtrain):
+    labels = dtrain.get_label()
+    p = 1.0 / (1.0 + np.exp(-preds))
+    err = np.mean((p > 0.5).astype(float) != labels)
+    return "custom_error", err
+
+params = {"max_depth": 3, "eta": 0.3, "disable_default_eval_metric": 1}
+bst = xgb.train(params, dtrain, num_boost_round=10, obj=logregobj,
+                 evals=[(dtest, "eval")], custom_metric=custom_error,
+                 verbose_eval=False, evals_result=(res := {}))
+print("evals_result keys:", list(res["eval"].keys()))
+
+pred_prob = 1.0 / (1.0 + np.exp(-bst.predict(dtest, output_margin=True)))
+bst_builtin = xgb.train({"max_depth": 3, "eta": 0.3, "objective": "binary:logistic"}, dtrain, num_boost_round=10)
+print("accuracy(自前logregobj):", accuracy_score(yte, (pred_prob > 0.5).astype(int)))
+print("accuracy(組み込みbinary:logistic):", accuracy_score(yte, (bst_builtin.predict(dtest) > 0.5).astype(int)))
+```
+実行結果:
+```
+evals_result keys: ['custom_error']
+accuracy(自前logregobj): 0.9298245614035088
+accuracy(組み込みbinary:logistic): 0.9298245614035088
+```
+
+**注意点・落とし穴**:
+- `obj`使用時、`Booster.predict()`はデフォルトでは`output_margin=False`でもロジスティック変換(シグモイド)を適用しない生のマージン値を返す(`objective`が`binary:logistic`ではなく`obj`が生スコアを直接最適化する扱いになるため)。この例のように`output_margin=True`で取り出して自分でシグモイドを適用する必要がある。
+- `params`に`"objective"`を指定しないまま`obj`だけ渡すと、内部的にはデフォルトの`"reg:squarederror"`が設定される。`Booster.save_config()`で確認すると`learner.objective.name`が`"reg:squarederror"`のままになっており(実測済み)、実際には`obj`の勾配・ヘシアンで学習しているにもかかわらず設定名だけは紛らわしいので注意。
+- `custom_metric`を指定しても、`params["objective"]`が(未指定により)`"reg:squarederror"`扱いのままだと既定の評価指標(`rmse`)も自動的に評価結果に混ざる。それを避けるには`disable_default_eval_metric=1`を`params`に加える(実測で`evals_result`のキーから`rmse`が消えることを確認)。
+
+### `objective=<callable>`(scikit-learn API)
+
+**用途**: `XGBClassifier`/`XGBRegressor`でも、文字列ではなく`(grad, hess)`を返す関数を`objective`に渡すことでカスタム目的関数を使える。
+
+**シグネチャ**: `xgboost.XGBClassifier(*, objective: Union[str, Callable[[Any, Any], Tuple[np.ndarray, np.ndarray]], None] = 'binary:logistic', **kwargs)`(`XGBRegressor`も同様のUnion型で、デフォルトは`'reg:squarederror'`)
+
+**使用例**:
+```python
+import numpy as np
+import xgboost as xgb
+
+def logregobj(preds, dtrain):
+    labels = dtrain.get_label() if hasattr(dtrain, "get_label") else dtrain
+    p = 1.0 / (1.0 + np.exp(-preds))
+    return p - labels, p * (1.0 - p)
+
+clf = xgb.XGBClassifier(n_estimators=20, max_depth=3, objective=logregobj, random_state=0)
+clf.fit(Xtr, ytr)
+print("predict_proba[:2]:", clf.predict_proba(Xte[:2]).round(3))
+print("objective属性:", clf.objective)
+```
+実行結果:
+```
+predict_proba[:2]: [[1. 0.]
+ [1. 0.]]
+objective属性: <function logregobj at 0x7736125b8400>
+```
+(`objective属性`のメモリアドレス部分は実行のたびに変わる)
+
+**注意点・落とし穴**:
+- `XGBClassifier.predict_proba()`は、`fit`時に検出したクラス数(2値分類)に基づいて内部で自動的にシグモイド変換を適用する。これは`objective`に何を渡したかに関係なく行われる挙動であり、`obj`が本当にロジスティック損失を再現していないカスタム関数の場合でも同じくシグモイドが適用されてしまう点に注意(`predict_proba`の出力を確率として信頼できるかは、渡した`objective`が実際にロジスティック損失に対応しているかどうかに依存する)。
+
+---
+
+## 11. 単調性制約・特徴量間相互作用制約
+
+### `monotone_constraints`
+
+**用途**: 特定の特徴量に対して、予測値が単調増加/単調減少になるよう木の分岐を制約する。ドメイン知識(例:「価格は面積が広いほど高くなるはず」)をモデルに強制したいときに使う。
+
+**シグネチャ**: `XGBRegressor(..., monotone_constraints=None, ...)`(内部デフォルトは制約なし)。値はタプル/文字列で、各特徴量に対応する位置に`1`(単調増加)・`-1`(単調減少)・`0`(制約なし)を指定する(例: `(1, -1)`)。
+
+**使用例**:
+```python
+import numpy as np
+import xgboost as xgb
+
+rng = np.random.default_rng(0)
+n = 2000
+x1 = rng.uniform(-3, 3, n)
+x2 = rng.uniform(-3, 3, n)
+y = 2.0 * x1 - 1.0 * x2 + rng.normal(0, 1.0, n)   # x1に対して増加、x2に対して減少
+X = np.column_stack([x1, x2])
+
+reg_free = xgb.XGBRegressor(n_estimators=100, max_depth=4, random_state=0).fit(X, y)
+reg_mono = xgb.XGBRegressor(n_estimators=100, max_depth=4, random_state=0,
+                             monotone_constraints=(1, -1)).fit(X, y)
+
+grid = np.linspace(-3, 3, 50)
+X_grid = np.column_stack([grid, np.zeros_like(grid)])
+
+def is_monotonic_increasing(a):
+    return np.all(np.diff(a) >= -1e-9)
+
+print("制約なし: x1に対して単調増加か:", is_monotonic_increasing(reg_free.predict(X_grid)))
+print("制約あり: x1に対して単調増加か:", is_monotonic_increasing(reg_mono.predict(X_grid)))
+```
+実行結果:
+```
+制約なし: x1に対して単調増加か: False
+制約あり: x1に対して単調増加か: True
+```
+
+**注意点・落とし穴**:
+- 制約は「学習データの範囲内外を問わず」予測関数の形に対してかかる。誤った方向を指定すると精度が大きく損なわれることがあるため、事前にドメイン知識で方向を確認してから使う。
+- `tree_method`によって内部の制約実装(`exact`系と`hist`系)が異なるが、挙動としてはどちらも単調性を保証する。
+
+### `interaction_constraints`
+
+**用途**: 指定したグループ内の特徴量同士だけが同じ木の分岐パス上で組み合わさることを許可し、グループを跨いだ相互作用を禁止する。
+
+**シグネチャ**: `XGBRegressor(..., interaction_constraints=None, ...)`。値は特徴量名のリストのリスト(例: `[["f0", "f1"], ["f2", "f3"]]`)、または旧来の整数インデックス形式をそのまま使いたい場合はJSON文字列(例: `"[[0,1],[2,3]]"`)を渡す。
+
+**使用例**:
+```python
+import numpy as np
+import xgboost as xgb
+
+rng = np.random.default_rng(0)
+n = 3000
+X = rng.uniform(-2, 2, size=(n, 4))
+y = (X[:, 0] * X[:, 1]) + (X[:, 2] + X[:, 3]) + rng.normal(0, 0.3, n)
+dtrain = xgb.DMatrix(X, label=y, feature_names=["f0", "f1", "f2", "f3"])
+
+def mixed_tree_count(bst):
+    df = bst.trees_to_dataframe()
+    count = 0
+    for tid in df["Tree"].unique():
+        feats = set(df[(df["Tree"] == tid) & (df["Feature"] != "Leaf")]["Feature"])
+        if (feats & {"f0", "f1"}) and (feats & {"f2", "f3"}):
+            count += 1
+    return count, df["Tree"].nunique()
+
+bst_free = xgb.train({"max_depth": 4, "eta": 0.3, "objective": "reg:squarederror"}, dtrain, num_boost_round=20)
+bst_cons = xgb.train({"max_depth": 4, "eta": 0.3, "objective": "reg:squarederror",
+                       "interaction_constraints": [["f0", "f1"], ["f2", "f3"]]}, dtrain, num_boost_round=20)
+
+print("制約なし: 両グループを使う木の本数:", mixed_tree_count(bst_free))
+print("制約あり: 両グループを使う木の本数:", mixed_tree_count(bst_cons))
+```
+実行結果:
+```
+制約なし: 両グループを使う木の本数: (18, 20)
+制約あり: 両グループを使う木の本数: (0, 20)
+```
+
+**注意点・落とし穴**:
+- **バージョン固有の注意**: xgboost 3.4.1で`interaction_constraints`にリストのリストを渡す場合、要素は整数インデックスではなく**特徴量名の文字列**でなければならない(内部で`DMatrix`/`XGBModel`の`feature_names`と突き合わせて整数に変換する実装になっている)。`[[0, 1], [2, 3]]`のように整数を直接渡すと`ValueError: Constrained features are not a subset of training data feature names`になる(実際にエラーを再現して確認済み)。整数インデックスをそのまま使いたい場合は、JSON文字列形式(`"[[0,1],[2,3]]"`)であれば`isinstance(value, str)`の分岐で変換をバイパスできる。
+- 制約に含まれていない特徴量(グループのどれにも属さない特徴量)は無制限に使われる。「指定したグループの外の特徴量同士も自由に組み合わさる」点を誤解しないこと。
+
+---
+
+## 12. SHAP値の深掘り
+
+### `Booster.predict(..., pred_interactions=True)`
+
+**用途**: 特徴量ペアごとの相互作用まで分解したSHAP交互作用値(TreeSHAP interaction values)を取得する。
+
+**シグネチャ**: `Booster.predict(self, data, *, pred_interactions=False, ...)`(1章の`Booster.predict`シグネチャ参照)
+
+**使用例**:
+```python
+import numpy as np
+import xgboost as xgb
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+
+data = load_breast_cancer()
+Xtr, Xte, ytr, yte = train_test_split(data.data, data.target, test_size=0.2, random_state=0, stratify=data.target)
+dtrain = xgb.DMatrix(Xtr, label=ytr)
+dtest = xgb.DMatrix(Xte, label=yte)
+bst = xgb.train({"max_depth": 4, "eta": 0.3, "objective": "binary:logistic"}, dtrain, num_boost_round=20)
+
+inter = bst.predict(dtest, pred_interactions=True)
+contribs = bst.predict(dtest, pred_contribs=True)
+margin = bst.predict(dtest, output_margin=True)
+
+print("pred_interactions shape:", inter.shape)
+print("pred_contribs shape:", contribs.shape)
+print("交互作用行列の全成分合計 == マージン予測値:", np.allclose(inter.sum(axis=(1, 2)), margin, atol=1e-4))
+print("交互作用行列を1軸で合計 == pred_contribsと一致:", np.allclose(inter.sum(axis=2), contribs, atol=1e-4))
+```
+実行結果:
+```
+pred_interactions shape: (114, 31, 31)
+pred_contribs shape: (114, 31)
+交互作用行列の全成分合計 == マージン予測値: True
+交互作用行列を1軸で合計 == pred_contribsと一致: True
+```
+
+**注意点・落とし穴**:
+- 出力は`(サンプル数, 特徴量数+1, 特徴量数+1)`の3次元配列(最後の行・列はバイアス項)。特徴量数が多いモデルではメモリ消費・計算コストが`pred_contribs=True`より大幅に大きくなるため、全データに対して常用するのは避け、分析対象を絞って使う。
+- 対角成分がその特徴量単独の寄与、非対角成分(`[i,j]`と`[j,i]`は等しい)が特徴量`i`と`j`の交互作用の寄与を表す。どちらか片方の軸だけを合計すると`pred_contribs`と一致する(実測で確認済み)。
+
+### `Booster.predict(..., approx_contribs=True)`
+
+**用途**: 厳密なTreeSHAP(デフォルト)の代わりに、より高速だが近似的な寄与度(Saabas法に近い近似)を計算する。
+
+**シグネチャ**: `Booster.predict(self, data, *, pred_contribs=False, approx_contribs=False, ...)`
+
+**使用例**:
+```python
+exact = bst.predict(dtest, pred_contribs=True)
+approx = bst.predict(dtest, pred_contribs=True, approx_contribs=True)
+print("exact と approx が完全一致するか:", np.allclose(exact, approx))
+print("最大絶対差:", round(float(np.max(np.abs(exact - approx))), 4))
+print("exact[0,:5]:", exact[0, :5].round(4))
+print("approx[0,:5]:", approx[0, :5].round(4))
+```
+実行結果:
+```
+exact と approx が完全一致するか: False
+最大絶対差: 1.0769
+exact[0,:5]: [ 0.     -0.0927  0.      0.0104 -0.0554]
+approx[0,:5]: [ 0.      0.      0.      0.     -0.0693]
+```
+
+**注意点・落とし穴**:
+- `approx_contribs=True`は厳密なShapley値の公理(効率性・対称性など)を満たさない近似計算であり、結果は`approx_contribs=False`(デフォルト、厳密なTreeSHAP)と大きく異なりうる(実測で最大絶対差が1を超える例を確認)。精度が重要な分析用途では既定の厳密版を使い、`approx_contribs=True`は計算コストがボトルネックになる大規模データでの高速化目的に限定するのが安全。
+
+---
+
+## 13. ハイパーパラメータチューニングの実践パターン
+
+### `RandomizedSearchCV` + `XGBClassifier`
+
+**用途**: scikit-learnの`RandomizedSearchCV`で、xgboostのハイパーパラメータ(`max_depth`/`learning_rate`/`subsample`/`n_estimators`など)を分布からランダムサンプリングして探索する。
+
+**シグネチャ**: `sklearn.model_selection.RandomizedSearchCV(estimator, param_distributions, *, n_iter=10, scoring=None, n_jobs=None, refit=True, cv=None, verbose=0, pre_dispatch='2*n_jobs', random_state=None, error_score=nan, return_train_score=False)`(scikit-learn 1.9.0で検証)
+
+**使用例**:
+```python
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from scipy.stats import randint, uniform
+import xgboost as xgb
+
+data = load_breast_cancer()
+Xtr, Xte, ytr, yte = train_test_split(data.data, data.target, test_size=0.2, random_state=0, stratify=data.target)
+
+param_dist = {
+    "max_depth": randint(2, 6),
+    "learning_rate": uniform(0.01, 0.29),
+    "subsample": uniform(0.6, 0.4),
+    "n_estimators": randint(50, 200),
+}
+base = xgb.XGBClassifier(random_state=0, eval_metric="logloss")
+search = RandomizedSearchCV(base, param_distributions=param_dist, n_iter=8, cv=3,
+                             scoring="accuracy", random_state=0, n_jobs=1)
+search.fit(Xtr, ytr)
+print("best_params_:", search.best_params_)
+print("best_score_:", round(search.best_score_, 4))
+print("test score of best_estimator_:", round(search.best_estimator_.score(Xte, yte), 4))
+```
+実行結果:
+```
+best_params_: {'learning_rate': np.float64(0.14852288402319147), 'max_depth': 5, 'n_estimators': 137, 'subsample': np.float64(0.7919908689500229)}
+best_score_: 0.9648
+test score of best_estimator_: 0.9474
+```
+
+**注意点・落とし穴**:
+- `RandomizedSearchCV`自体はxgboost固有の機能ではないが、`GridSearchCV`のように全組み合わせを総当たりしないため、探索空間が広いxgboostのチューニング(`max_depth`×`learning_rate`×`subsample`×`n_estimators`×...)では現実的な計算時間で回せる利点がある。`n_iter`が実際に試す組み合わせ数を決める。
+- `XGBClassifier`に`eval_metric`だけ渡し`early_stopping_rounds`は渡していない(`RandomizedSearchCV`は`fit`に`eval_set`を自動では渡さないため、`CV`のループ内でearly stoppingを使うには`fit_params`経由で`eval_set`を明示的に渡すなど追加の工夫が必要)。
+
+### `evals_result()`による学習曲線(訓練/検証の乖離を見る)
+
+**用途**: `eval_set`に訓練データと検証データの両方を渡し、ラウンドごとの指標推移から過学習の兆候を確認する。
+
+**シグネチャ**: `XGBClassifier.fit(self, X, y, *, eval_set=None, ...)` / `XGBClassifier.evals_result(self) -> dict`
+
+**使用例**:
+```python
+clf = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1,
+                         eval_metric=["logloss", "error"], random_state=0)
+clf.fit(Xtr, ytr, eval_set=[(Xtr, ytr), (Xte, yte)], verbose=False)
+res = clf.evals_result()
+train_logloss = res["validation_0"]["logloss"]
+val_logloss = res["validation_1"]["logloss"]
+print("train_logloss: 1ラウンド目=%.4f 最終ラウンド=%.4f" % (train_logloss[0], train_logloss[-1]))
+print("val_logloss:   1ラウンド目=%.4f 最終ラウンド=%.4f" % (val_logloss[0], val_logloss[-1]))
+```
+実行結果:
+```
+train_logloss: 1ラウンド目=0.5767 最終ラウンド=0.0103
+val_logloss:   1ラウンド目=0.5833 最終ラウンド=0.1763
+```
+
+**注意点・落とし穴**:
+- `eval_set`の1番目に渡したデータが`validation_0`、2番目が`validation_1`という機械的な命名になる(データの中身が「訓練」か「検証」かはキー名からは分からず、渡した順番を自分で把握しておく必要がある)。
+- この例では訓練データのlogloss(0.0103)が検証データのlogloss(0.1763)より大幅に低く、ラウンドが進むほど両者が乖離しており過学習の典型的なパターンが確認できる。`early_stopping_rounds`(4章)と組み合わせて、乖離が始まる直前で打ち切るのが実践的なパターン。
+
+### `xgboost.callback.LearningRateScheduler(...)`
+
+**用途**: ラウンドごとに学習率(`eta`)を動的に変化させる(例:ラウンドが進むにつれて減衰させる)。
+
+**シグネチャ**: `xgboost.callback.LearningRateScheduler(self, learning_rates: Union[Callable[[int], float], Sequence[float]])`
+
+**使用例**:
+```python
+import json
+import xgboost as xgb
+
+def lr_sched(epoch):
+    return 0.3 * (0.95 ** epoch)
+
+lrs = xgb.callback.LearningRateScheduler(lr_sched)
+bst = xgb.train({"max_depth": 3, "objective": "binary:logistic"}, dtrain, num_boost_round=10,
+                 callbacks=[lrs], evals=[(dtest, "eval")], verbose_eval=False,
+                 evals_result=(res := {}))
+cfg = json.loads(bst.save_config())
+print("最終ラウンド時点のeta:", cfg["learner"]["gradient_booster"]["tree_train_param"]["eta"])
+print("手計算(0.3*0.95**9):", round(0.3 * 0.95 ** 9, 9))
+print("最終ラウンドのeval logloss:", round(res["eval"]["logloss"][-1], 4))
+```
+実行結果:
+```
+最終ラウンド時点のeta: 0.189074829
+手計算(0.3*0.95**9): 0.189074823
+最終ラウンドのeval logloss: 0.1847
+```
+
+**注意点・落とし穴**:
+- `learning_rates`に渡す関数は「現在のラウンド番号(0始まり)」を受け取り、そのラウンドで使う`eta`を返す。固定値のリスト/タプル(`num_boost_round`と同じ長さ)を渡すこともできる。
+- `XGBClassifier`側にも`callbacks`引数があるため、scikit-learn APIでも同様に使える(`xgb.XGBClassifier(..., callbacks=[lrs])`)。
+
+---
+
+## 14. 特殊なタスク・モデル診断の応用
+
+### `Booster.predict(..., pred_leaf=True)`
+
+**用途**: 各サンプルが各木でどの葉ノードに落ちたか(葉のインデックス)を取得する。得られたインデックスをワンホット化して別モデルの特徴量にする「木の葉によるスタッキング」的な使い方ができる。
+
+**シグネチャ**: `Booster.predict(self, data, *, pred_leaf=False, ...)`
+
+**使用例**:
+```python
+leaf_idx = bst.predict(dtest, pred_leaf=True)
+print("pred_leaf shape:", leaf_idx.shape)
+print("dtype:", leaf_idx.dtype)
+print("1サンプル目の各木での葉インデックス:", leaf_idx[0])
+```
+実行結果:
+```
+pred_leaf shape: (114, 20)
+dtype: float32
+1サンプル目の各木での葉インデックス: [10. 10. 12. 12. 18. 14. 14. 10.  6. 12. 10.  6. 10.  6.  6. 10. 10.  2.
+  6.  6.]
+```
+
+**注意点・落とし穴**:
+- 出力の列数は木の本数(`num_boosted_rounds()`)と一致する。多クラス分類では「ラウンド数×クラス数」本の木があるため列数もその分だけ増える。
+- 値は`float32`型だが中身は整数の葉インデックスなので、後続処理(ワンホットエンコードなど)では明示的に整数キャストしてから使うのが安全。
+
+### `multi_strategy="multi_output_tree"`
+
+**用途**: 複数の目的変数(マルチターゲット回帰)を、ターゲットごとに独立した木の集合を作るのではなく、1本の木が複数出力を同時に予測する構造で学習する。
+
+**シグネチャ**: `XGBRegressor(..., multi_strategy=None, ...)`(内部デフォルトは`"one_output_per_tree"`。`"multi_output_tree"`を指定すると1本の木で複数出力を扱う)
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.datasets import make_regression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
+import xgboost as xgb
+
+rng = np.random.default_rng(0)
+X, y1 = make_regression(n_samples=300, n_features=5, noise=5.0, random_state=0)
+y2 = y1 * 0.5 + rng.normal(0, 5, size=y1.shape[0])
+Y = np.column_stack([y1, y2])
+Xtr2, Xte2, Ytr2, Yte2 = train_test_split(X, Y, test_size=0.2, random_state=0)
+
+reg_multi = xgb.XGBRegressor(n_estimators=50, max_depth=3, multi_strategy="multi_output_tree",
+                              tree_method="hist", random_state=0).fit(Xtr2, Ytr2)
+reg_default = xgb.XGBRegressor(n_estimators=50, max_depth=3, random_state=0).fit(Xtr2, Ytr2)
+
+print("predict shape (multi_output_tree):", reg_multi.predict(Xte2).shape)
+print("R2 per output (multi_output_tree):", r2_score(Yte2, reg_multi.predict(Xte2), multioutput="raw_values").round(3))
+print("R2 per output (既定 one_output_per_tree):", r2_score(Yte2, reg_default.predict(Xte2), multioutput="raw_values").round(3))
+```
+実行結果:
+```
+predict shape (multi_output_tree): (60, 2)
+R2 per output (multi_output_tree): [0.958 0.96 ]
+R2 per output (既定 one_output_per_tree): [0.961 0.941]
+```
+
+**注意点・落とし穴**:
+- `multi_strategy="multi_output_tree"`は`tree_method="hist"`(またはGPU版)でのみサポートされる比較的新しい機能。既定の`"one_output_per_tree"`(出力ごとに個別の木群を学習)と比べて、出力間の相関を木構造自体で捉えられる可能性がある一方、常に精度が上がるわけではない(この実測例では片方の出力で改善、もう片方はほぼ同等)。
+
+### `objective="reg:quantileerror"` + `quantile_alpha`
+
+**用途**: 複数の分位点(例:10%点・中央値・90%点)を1回の学習でまとめて予測する分位点回帰。
+
+**シグネチャ**: `XGBRegressor(objective="reg:quantileerror", quantile_alpha=None, ...)`(`quantile_alpha`に単一の分位点、またはリストで複数の分位点を指定)
+
+**使用例**:
+```python
+from sklearn.datasets import make_regression
+from sklearn.model_selection import train_test_split
+import xgboost as xgb
+import numpy as np
+
+X, y = make_regression(n_samples=500, n_features=5, noise=15.0, random_state=0)
+Xtr3, Xte3, ytr3, yte3 = train_test_split(X, y, test_size=0.2, random_state=0)
+
+reg_q = xgb.XGBRegressor(objective="reg:quantileerror", quantile_alpha=[0.1, 0.5, 0.9],
+                          n_estimators=100, max_depth=3, random_state=0)
+reg_q.fit(Xtr3, ytr3)
+pred_q = reg_q.predict(Xte3)
+print("predict shape:", pred_q.shape)
+print("1サンプル目 [q0.1, q0.5, q0.9]:", pred_q[0].round(2))
+print("q0.1<=q0.5<=q0.9が全サンプルで成立:", bool(np.all(pred_q[:, 0] <= pred_q[:, 1]) and np.all(pred_q[:, 1] <= pred_q[:, 2])))
+coverage = np.mean((yte3 >= pred_q[:, 0]) & (yte3 <= pred_q[:, 2]))
+print("実測値がq0.1〜q0.9に収まる割合:", round(coverage, 3))
+```
+実行結果:
+```
+predict shape: (100, 3)
+1サンプル目 [q0.1, q0.5, q0.9]: [-129.65  -99.94  -81.34]
+q0.1<=q0.5<=q0.9が全サンプルで成立: True
+実測値がq0.1〜q0.9に収まる割合: 0.6
+```
+
+**注意点・落とし穴**:
+- `quantile_alpha`にリストを渡すと`predict()`の出力が`(サンプル数, 分位点数)`の2次元配列になる(`quantile_alpha`を単一の浮動小数点数にすると1次元配列に戻る)。
+- この実測例では「q0.1〜q0.9区間」の理論的なカバー率(80%)に対し、実測のカバー率は60%だった。ハイパーパラメータ(木の本数・深さなど)を調整せずにデフォルト寄りの設定で試した結果であり、分位点回帰は通常の回帰よりキャリブレーション(区間の妥当性)を別途検証する必要があることを示す一例。
+
+### `xgboost.XGBRanker(...)`
+
+**用途**: 検索結果のランキングなど、「グループ内での相対順序」を学習するランキングタスク用のscikit-learn APIラッパー。
+
+**シグネチャ**: `xgboost.XGBRanker(*, objective='rank:ndcg', **kwargs)`。`fit(self, X, y, *, group=None, qid=None, ...)`(`qid`でグループ(クエリ)ごとにサンプルをまとめる)。
+
+**使用例**:
+```python
+import numpy as np
+import xgboost as xgb
+from scipy.stats import spearmanr
+
+rng = np.random.default_rng(0)
+n_groups, docs_per_group = 20, 10
+X = rng.uniform(0, 1, size=(n_groups * docs_per_group, 4))
+true_rel = np.clip((X[:, 0] * 3).astype(int), 0, 3)   # 関連度はほぼ特徴量0で決まる
+qid = np.repeat(np.arange(n_groups), docs_per_group)
+
+ranker = xgb.XGBRanker(objective="rank:pairwise", n_estimators=50, max_depth=3, random_state=0)
+ranker.fit(X, true_rel, qid=qid)
+scores = ranker.predict(X)
+print("scores shape:", scores.shape)
+corr = spearmanr(scores[:docs_per_group], true_rel[:docs_per_group]).correlation
+print("グループ0内の順位相関(予測スコア vs 真の関連度):", round(corr, 3))
+```
+実行結果:
+```
+scores shape: (200,)
+グループ0内の順位相関(予測スコア vs 真の関連度): 0.967
+```
+
+**注意点・落とし穴**:
+- `y`(この例では`true_rel`)は「絶対的なラベル」ではなく「同じ`qid`グループ内での相対順序」を学習するためだけに使われる。グループを跨いだスコアの大小比較には意味がない。
+- `qid`はグループ番号でソート済みである必要がある(この例のように`np.repeat`で連続したブロックを作る)。バラバラの順序で渡すとエラーになるか意図しない学習結果になる。
+- 既定の`objective`は`'rank:ndcg'`だが、この例では`'rank:pairwise'`を明示的に指定している(2章のようにデフォルトのまま使う場合は`objective`を省略できる)。
+
+### `Booster.get_split_value_histogram(...)`
+
+**用途**: 特定の特徴量について、全ての木でどのしきい値がどれだけ分岐に使われたかをヒストグラム(DataFrame)として取得する。
+
+**シグネチャ**: `Booster.get_split_value_histogram(self, feature: str, fmap: PathLike = '', bins: Optional[int] = None, as_pandas: bool = True) -> Union[np.ndarray, pd.DataFrame]`
+
+**使用例**:
+```python
+import xgboost as xgb
+from sklearn.datasets import load_breast_cancer
+
+data = load_breast_cancer()
+dtrain_h = xgb.DMatrix(data.data, label=data.target, feature_names=list(data.feature_names))
+bst_h = xgb.train({"max_depth": 3, "objective": "binary:logistic"}, dtrain_h, num_boost_round=10)
+hist = bst_h.get_split_value_histogram("worst radius", bins=5)
+print(type(hist))
+print(hist)
+```
+実行結果:
+```
+<class 'pandas.DataFrame'>
+   SplitValue  Count
+0   15.496667    1.0
+1   17.730000    2.0
+```
+(`bins=5`を指定しても、実際に分岐に使われたしきい値の種類が少ない場合はそれより少ない行数になる)
+
+**注意点・落とし穴**:
+- `bins`は「最大でこの数まで」という上限であり、実際の出力行数は分岐に使われたユニークなしきい値の数以下になる(この例では5を指定しても2行しか返らない)。
+- `trees_to_dataframe()`(5章)から自分で`Feature`列を絞り込んで集計しても同等の情報は得られるが、単一特徴量のしきい値分布だけを素早く確認したいときはこちらの方が簡潔。

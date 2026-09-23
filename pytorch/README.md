@@ -16,6 +16,15 @@ PyTorch 2.13.0 (CPU) で検証済み。すべてのシグネチャ・実行結�
 10. [デバイス・型変換](#10-デバイス型変換)
 11. [保存・読み込み](#11-保存読み込み)
 
+## 応用・発展
+
+12. [カスタムautograd.Function](#12-カスタムautogradfunction)
+13. [フック](#13-フック)
+14. [高度なインデックス操作](#14-高度なインデックス操作)
+15. [CNN/RNN層の構築](#15-cnnrnn層の構築)
+16. [学習率スケジューラの深掘り](#16-学習率スケジューラの深掘り)
+17. [カスタムDataset/Sampler・torch.compile](#17-カスタムdatasetsamplertorchcompile)
+
 ---
 
 ## 1. テンソル生成・基礎操作
@@ -1221,3 +1230,603 @@ True
 **注意点・落とし穴**:
 - `load_state_dict`を使う前に、読み込み先のモデル(`m2`)を保存元と**同じアーキテクチャ**で先にインスタンス化しておく必要がある(構造そのものは保存されず、パラメータの値だけが保存される)。
 - `strict=True`(デフォルト)では、キーが一部でも一致しないと`RuntimeError`になる。部分的な読み込みを許容したい場合は`strict=False`を指定する。
+
+---
+
+## 応用・発展
+
+以降はより高度・niche なAPI群。基礎編(1〜11章)より発展的な内容を扱う。
+
+## 12. カスタムautograd.Function
+
+### `torch.autograd.Function`(forward/backward自作)
+
+**用途**: 既存の微分可能演算の組み合わせでは表現できない、独自の順伝播・逆伝播の計算式をautogradに組み込む。
+
+**シグネチャ**: `class Fn(torch.autograd.Function): staticmethod forward(ctx, *args) -> Any; staticmethod backward(ctx, *grad_outputs) -> Any`(`inspect.signature(torch.autograd.Function.forward)`は`(*args: Any, **kwargs: Any) -> Any`、`.backward`は`(ctx: Any, *grad_outputs: Any) -> Any`。呼び出しは`Fn.apply(*args)`で行う)
+
+**使用例**:
+```python
+import torch
+
+class MySquare(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x ** 2
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        return grad_output * 2 * x
+
+x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+y = MySquare.apply(x)
+print(y)
+y.sum().backward()
+print(x.grad)
+```
+実行結果:
+```
+tensor([1., 4., 9.], grad_fn=<MySquareBackward>)
+tensor([2., 4., 6.])
+```
+
+**注意点・落とし穴**:
+- 呼び出しは`MySquare(x)`ではなく**`MySquare.apply(x)`**を使う(`apply`はautogradエンジンに登録する処理を挟む特別なクラスメソッドであり、`forward`を直接呼ぶと計算グラフに組み込まれない)。
+- `ctx.save_for_backward(x)`で保存したテンソルは`backward`内で`ctx.saved_tensors`から取り出す。`backward`の戻り値の個数は`forward`の(`ctx`を除く)引数の個数と一致させる必要がある。
+
+### `torch.autograd.gradcheck(...)`
+
+**用途**: 自作した`backward`の実装が数値微分(有限差分)と一致するかを検証する。カスタムFunctionのデバッグに必須。
+
+**シグネチャ**: `torch.autograd.gradcheck(func, inputs, *, eps=1e-06, atol=1e-05, rtol=0.001, raise_exception=True, nondet_tol=0.0, check_undefined_grad=True, check_grad_dtypes=False, check_batched_grad=False, check_batched_forward_grad=False, check_forward_ad=False, check_backward_ad=True, fast_mode=False, masked=None) -> bool`
+
+**使用例**:
+```python
+x2 = torch.randn(5, dtype=torch.float64, requires_grad=True)
+ok = torch.autograd.gradcheck(MySquare.apply, (x2,))
+print("gradcheck:", ok)
+```
+実行結果:
+```
+gradcheck: True
+```
+
+**注意点・落とし穴**:
+- 数値差分の精度確保のため、入力は`dtype=torch.float64`(倍精度)で用意するのが定石(`float32`だと丸め誤差で誤って失敗判定になりやすい)。
+- 検証に失敗すると(`raise_exception=True`がデフォルトのため)戻り値を返さず`GradcheckError`を送出する。失敗理由だけ知りたい場合は`raise_exception=False`にする。
+
+---
+
+## 13. フック
+
+### `Tensor.register_hook(...)`
+
+**用途**: 特定のテンソルに対して`backward()`実行時に流れる勾配を横取り(観察・変更)するコールバックを登録する。
+
+**シグネチャ**: `Tensor.register_hook(hook) -> RemovableHandle`(`inspect.signature`より。`hook`は`grad -> Tensor または None`を受け取る)
+
+**使用例**:
+```python
+x = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+y = x * 2
+captured = []
+handle = y.register_hook(lambda grad: captured.append(grad.clone()))
+z = y.sum()
+z.backward()
+print(captured)
+handle.remove()
+```
+実行結果:
+```
+[tensor([1., 1., 1.])]
+```
+
+**注意点・落とし穴**:
+- `requires_grad=True`の**リーフテンソルでなくても**(中間テンソル`y`でも)登録できる点が`.grad`属性との違い(中間テンソルの`.grad`は通常`None`のまま保持されないが、フックなら値を取得できる)。
+- フックは`handle.remove()`を呼ぶまで有効であり続ける。ループ内で毎回登録すると同じテンソルに複数のフックが蓄積するので、使い終わったら明示的に`remove()`する。
+
+### `nn.Module.register_forward_hook(...)` / `register_forward_pre_hook(...)`
+
+**用途**: `nn.Module`の`forward`実行の**直後**(`forward_hook`)または**直前**(`forward_pre_hook`)に割り込んで、入出力の観察・改変を行う。中間層の出力を取り出す(特徴抽出)用途でよく使われる。
+
+**シグネチャ**: `nn.Module.register_forward_hook(hook, *, prepend=False, with_kwargs=False, always_call=False) -> RemovableHandle` / `nn.Module.register_forward_pre_hook(hook, *, prepend=False, with_kwargs=False) -> RemovableHandle`
+
+**使用例**:
+```python
+import torch.nn as nn
+
+torch.manual_seed(0)
+lin = nn.Linear(3, 2)
+
+def fwd_pre_hook(module, args):
+    print("pre_hook input shape:", args[0].shape)
+
+def fwd_hook(module, args, output):
+    print("fwd_hook output:", output.detach())
+
+h1 = lin.register_forward_pre_hook(fwd_pre_hook)
+h2 = lin.register_forward_hook(fwd_hook)
+
+inp = torch.randn(1, 3, requires_grad=True)
+out = lin(inp)
+
+h1.remove(); h2.remove()
+```
+実行結果:
+```
+pre_hook input shape: torch.Size([1, 3])
+fwd_hook output: tensor([[-0.6316,  1.2920]])
+```
+
+**注意点・落とし穴**:
+- `forward_pre_hook`の`args`はモジュールへの入力の**タプル**(位置引数)。`forward_hook`の`output`は生の出力(勾配計算グラフに接続されたまま)なので、値を見るだけなら`.detach()`してから扱う方が安全。
+- フックは`model(x)`(`__call__`経由)でのみ発火する。`model.forward(x)`を直接呼ぶとフックは実行されない(6章の`nn.Module`の注意点と同じ理由)。
+
+### `nn.Module.register_full_backward_hook(...)`
+
+**用途**: モジュール単位で、逆伝播時にそのモジュールへの入力・出力に対する勾配を横取りする。
+
+**シグネチャ**: `nn.Module.register_full_backward_hook(hook, prepend=False) -> RemovableHandle`(`hook`は`(module, grad_input, grad_output) -> Tensor または None`)
+
+**使用例**:
+```python
+def bwd_hook(module, grad_input, grad_output):
+    print("bwd_hook grad_output:", grad_output)
+
+h3 = lin.register_full_backward_hook(bwd_hook)
+out = lin(inp)
+out.sum().backward()
+h3.remove()
+```
+実行結果:
+```
+bwd_hook grad_output: (tensor([[1., 1.]]),)
+```
+
+**注意点・落とし穴**:
+- `grad_input`/`grad_output`は(通常の`Tensor.register_hook`と違い)常に**タプル**で渡される(このモジュールへの入出力がそれぞれ1つでも`(tensor,)`という1要素タプルになる)。
+- 旧`register_backward_hook`(`full`が付かない版)は入出力が複数ある場合の挙動が未定義でバグの温床だったため非推奨。新しいコードでは`register_full_backward_hook`を使う。
+
+---
+
+## 14. 高度なインデックス操作
+
+### `Tensor.scatter(...)` / `.scatter_(...)`
+
+**用途**: `gather`の逆operation。`index`で指定した位置に`src`の値を書き込む(`.scatter_`は破壊的なin-place版)。
+
+**シグネチャ**: `Tensor.scatter(dim, index, src) -> Tensor`(C拡張のため`inspect.signature`は使用不可。`__doc__`の記法より)
+
+**使用例**:
+```python
+base = torch.zeros(3, 5)
+idx = torch.tensor([[0, 1, 2, 0, 0], [1, 2, 0, 1, 1], [2, 0, 1, 2, 2]])
+src = torch.arange(1, 16).view(3, 5).float()
+out = base.scatter(1, idx, src)
+print(out)
+```
+実行結果:
+```
+tensor([[ 5.,  2.,  3.,  0.,  0.],
+        [ 8., 10.,  7.,  0.,  0.],
+        [12., 13., 15.,  0.,  0.]])
+```
+
+**注意点・落とし穴**:
+- 同じ位置に複数回書き込まれる場合(この例の行0では列0に`src`の1番目・4番目・5番目の値がすべて書き込まれる)、**後勝ち**(最後に書き込まれた値が残る)になる。実際に列0は`1`ではなく`5`(=`src`の4番目の値)になっている。
+- one-hotベクトルの作成(`torch.zeros(n, c).scatter_(1, labels.unsqueeze(1), 1)`)によく使われる。
+
+### `Tensor.scatter_add_(...)`
+
+**用途**: `scatter_`と似ているが、上書きではなく**加算**で値を書き込む(重複位置の値は合算される)。
+
+**シグネチャ**: `Tensor.scatter_add_(dim, index, src) -> Tensor`(C拡張のため`inspect.signature`は使用不可。`__doc__`の記法より)
+
+**使用例**:
+```python
+base2 = torch.zeros(3)
+idx2 = torch.tensor([0, 1, 0, 2, 1])
+vals = torch.tensor([1., 2., 3., 4., 5.])
+base2.scatter_add_(0, idx2, vals)
+print(base2)
+```
+実行結果:
+```
+tensor([4., 7., 4.])
+```
+
+**注意点・落とし穴**:
+- `index=0`には`vals`の1番目(`1.`)と3番目(`3.`)が加算されて`4.`、`index=1`には2番目(`2.`)と5番目(`5.`)が加算されて`7.`になる(実行結果と一致)。グラフのノードごとの集約(GNN)やヒストグラム集計でよく使われる。
+
+### `torch.masked_select(...)`
+
+**用途**: ブールマスクで選んだ要素を**1次元テンソル**として抽出する(3章の`v[mask]`と同じ結果だが、関数形式で明示的に呼べる)。
+
+**シグネチャ**: `torch.masked_select(input, mask, *, out=None) -> Tensor`(C拡張のため`inspect.signature`は使用不可。`__doc__`の記法より)
+
+**使用例**:
+```python
+m = torch.arange(12).view(3, 4)
+mask = m % 2 == 0
+print(torch.masked_select(m, mask))
+```
+実行結果:
+```
+tensor([ 0,  2,  4,  6,  8, 10])
+```
+
+**注意点・落とし穴**:
+- 常にコピー(新しいメモリ)を返し、結果は1次元になる(3章のブールマスクインデックスと同じ制約)。
+
+### `torch.take(...)` / `torch.take_along_dim(...)`
+
+**用途**: `take`は入力を**平坦化した上で**1次元インデックスで要素を取り出す。`take_along_dim`は指定した`dim`に沿って、各行・列ごとに異なるインデックスで要素を取り出す(`argsort`の結果を使った並べ替えなどに便利)。
+
+**シグネチャ**: `torch.take(input, index) -> Tensor` / `torch.take_along_dim(input, indices, dim=None, *, out=None) -> Tensor`(いずれもC拡張のため`inspect.signature`は使用不可。`__doc__`の記法より)
+
+**使用例**:
+```python
+t = torch.tensor([[1, 2], [3, 4]])
+print(torch.take(t, torch.tensor([0, 2, 3])))
+
+tt = torch.tensor([[10, 30, 20], [60, 40, 50]])
+indices = tt.argsort(dim=1)
+print(indices)
+print(torch.take_along_dim(tt, indices, dim=1))
+```
+実行結果:
+```
+tensor([1, 3, 4])
+tensor([[0, 2, 1],
+        [1, 2, 0]])
+tensor([[10, 20, 30],
+        [40, 50, 60]])
+```
+
+**注意点・落とし穴**:
+- `take`のインデックスは元の形状に関係なく**平坦化後**の通し番号として扱われる(2次元テンソルでも`index`は1次元)。
+- `take_along_dim`は`index_select`と違い、行ごと・列ごとに**別々の**インデックス列を指定できる(`gather`に近いが、`indices`の形状制約が緩く`argsort`の結果をそのまま渡しやすい)。
+
+---
+
+## 15. CNN/RNN層の構築
+
+### `nn.Conv2d(...)`
+
+**用途**: 2次元畳み込み層。画像などの空間データに対してカーネル(フィルタ)をスライドさせて特徴マップを計算する。
+
+**シグネチャ**: `nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros', device=None, dtype=None)`
+
+**使用例**:
+```python
+torch.manual_seed(0)
+conv = nn.Conv2d(in_channels=3, out_channels=8, kernel_size=3, padding=1)
+x = torch.randn(2, 3, 16, 16)  # (batch, channels, height, width)
+out = conv(x)
+print(out.shape)
+print(conv.weight.shape, conv.bias.shape)
+```
+実行結果:
+```
+torch.Size([2, 8, 16, 16])
+torch.Size([8, 3, 3, 3]) torch.Size([8])
+```
+
+**注意点・落とし穴**:
+- 入力・出力の形状は`(batch, channels, height, width)`の4次元(NCHW)。`padding=1`かつ`kernel_size=3`のとき空間サイズ(高さ・幅)は変化しない(`16 -> 16`)。
+- `weight`の形状は`(out_channels, in_channels, kH, kW)`。`nn.Linear`同様、パラメータの先頭次元が出力側であることに注意。
+
+### `nn.MaxPool2d(...)`
+
+**用途**: 2次元の最大値プーリング。指定ウィンドウ内の最大値を取り、空間サイズを縮小する。
+
+**シグネチャ**: `nn.MaxPool2d(kernel_size, stride=None, padding=0, dilation=1, return_indices=False, ceil_mode=False)`
+
+**使用例**:
+```python
+pool = nn.MaxPool2d(kernel_size=2, stride=2)
+print(pool(out).shape)
+```
+実行結果:
+```
+torch.Size([2, 8, 8, 8])
+```
+
+**注意点・落とし穴**:
+- `stride`を省略すると`kernel_size`と同じ値になる(`Conv2d`の`stride`デフォルト`1`とは既定動作が異なるので注意)。この例では`16x16 -> 8x8`にちょうど半分になっている。
+
+### `nn.BatchNorm2d(...)`
+
+**用途**: チャネルごとにミニバッチ内で正規化(平均0・分散1)し、学習可能なスケール・シフトを適用する。学習を安定・高速化する。
+
+**シグネチャ**: `nn.BatchNorm2d(num_features, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True, device=None, dtype=None, *, bias=True)`
+
+**使用例**:
+```python
+bn = nn.BatchNorm2d(8)
+bn_out = bn(out)
+print(bn_out.shape)
+print(bn.running_mean[:3])
+```
+実行結果:
+```
+torch.Size([2, 8, 8, 8])
+tensor([-0.0190, -0.0196,  0.0140])
+```
+
+**注意点・落とし穴**:
+- `num_features`は入力のチャネル数(`Conv2d`の`out_channels`)と一致させる必要がある。
+- `running_mean`/`running_var`は`model.train()`モード実行時にのみ更新される移動平均。`model.eval()`モードでは(ミニバッチではなく)この移動平均を使って正規化するため、学習/評価モードの切り替え(`.train()`/`.eval()`)を忘れると挙動が変わる。
+
+### `nn.LSTM(...)`
+
+**用途**: 長短期記憶(LSTM)による再帰型ニューラルネットワーク層。系列データ(時系列・自然言語など)を扱う。
+
+**シグネチャ**: `nn.LSTM(*args, **kwargs)`(`inspect.signature`はC拡張ラッパーのため実質的な引数を返さない。主要引数は`input_size, hidden_size, num_layers=1, batch_first=False, ...`)
+
+**使用例**:
+```python
+torch.manual_seed(0)
+lstm = nn.LSTM(input_size=10, hidden_size=20, num_layers=1, batch_first=True)
+seq = torch.randn(4, 5, 10)  # (batch, seq_len, input_size)
+output, (h_n, c_n) = lstm(seq)
+print(output.shape, h_n.shape, c_n.shape)
+```
+実行結果:
+```
+torch.Size([4, 5, 20]) torch.Size([1, 4, 20]) torch.Size([1, 4, 20])
+```
+
+**注意点・落とし穴**:
+- `batch_first=False`がデフォルト(入力形状は`(seq_len, batch, input_size)`)。`batch_first=True`を明示しないと、他の層と同様バッチを先頭に置いた`(batch, seq_len, input_size)`のテンソルを渡すと形状がずれてしまう。
+- 戻り値は`(output, (h_n, c_n))`のタプル。`output`は全時刻の最終層の出力、`h_n`/`c_n`は最終時刻における各層の隠れ状態・セル状態(形状は`(num_layers, batch, hidden_size)`)。
+
+### `nn.Embedding(...)`
+
+**用途**: 整数インデックス(単語IDなど)を、学習可能な密ベクトル(埋め込み)に変換するルックアップテーブル。
+
+**シグネチャ**: `nn.Embedding(num_embeddings, embedding_dim, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False, _weight=None, _freeze=False, device=None, dtype=None)`
+
+**使用例**:
+```python
+torch.manual_seed(0)
+emb = nn.Embedding(num_embeddings=100, embedding_dim=4)
+idx = torch.tensor([1, 5, 99])
+print(emb(idx))
+print(emb.weight.shape)
+```
+実行結果:
+```
+tensor([[ 0.8487,  0.6920, -0.3160, -2.1152],
+        [ 0.5988, -1.5551, -0.3414,  1.8530],
+        [-0.6990,  0.5744,  1.2381, -0.6405]], grad_fn=<EmbeddingBackward0>)
+torch.Size([100, 4])
+```
+
+**注意点・落とし穴**:
+- 内部実装は`weight`という`(num_embeddings, embedding_dim)`形状のパラメータ行列の単純な行選択(`weight[idx]`相当)。`num_embeddings`を超えるインデックスを渡すと`IndexError`になる。
+- `padding_idx`を指定すると、そのインデックスに対応する行は勾配計算から除外され、常にゼロベクトルのまま更新されない(可変長系列のパディングトークン用)。
+
+---
+
+## 16. 学習率スケジューラの深掘り
+
+### `torch.optim.lr_scheduler.CosineAnnealingLR(...)`
+
+**用途**: 学習率をコサインカーブに沿って`T_max`ステップかけて滑らかに減衰させる。
+
+**シグネチャ**: `torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max, eta_min=0.0, last_epoch=-1)`
+
+**使用例**:
+```python
+torch.manual_seed(0)
+lin = nn.Linear(2, 1)
+opt = torch.optim.SGD(lin.parameters(), lr=0.1)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=5)
+lrs = []
+for epoch in range(6):
+    lrs.append(round(opt.param_groups[0]['lr'], 5))
+    opt.step()
+    sched.step()
+print(lrs)
+```
+実行結果:
+```
+[0.1, 0.09045, 0.06545, 0.03455, 0.00955, 0.0]
+```
+
+**注意点・落とし穴**:
+- `T_max`ステップ目でちょうど`eta_min`(デフォルト`0.0`)に到達する。それ以降さらに`step()`を呼び続けると、コサインカーブに沿って**再び上昇に転じる**(`T_max`を超えた運用は想定されていない)。
+- `8章`の`StepLR`のような階段状の減衰と異なり、なめらかに減衰する点が特徴。`OneCycleLR`などウォームアップ付きスケジューラの土台にもなっている。
+
+### `torch.optim.lr_scheduler.OneCycleLR(...)`
+
+**用途**: 学習率を低い値から`max_lr`まで急上昇させた後、残りステップでゆっくり下げる「1サイクル」スケジューリング(Leslie N. Smithの提案)。少ないエポック数での高速な学習収束を狙う。
+
+**シグネチャ**: `torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr, total_steps=None, epochs=None, steps_per_epoch=None, pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95, div_factor=25.0, final_div_factor=10000.0, three_phase=False, last_epoch=-1)`
+
+**使用例**:
+```python
+lin2 = nn.Linear(2, 1)
+opt2 = torch.optim.SGD(lin2.parameters(), lr=0.1)
+sched2 = torch.optim.lr_scheduler.OneCycleLR(opt2, max_lr=0.5, total_steps=10)
+lrs2 = []
+for step in range(10):
+    lrs2.append(round(opt2.param_groups[0]['lr'], 4))
+    opt2.step()
+    sched2.step()
+print(lrs2)
+```
+実行結果:
+```
+[0.02, 0.26, 0.5, 0.4752, 0.4059, 0.3056, 0.1944, 0.0941, 0.0248, 0.0]
+```
+
+**注意点・落とし穴**:
+- コンストラクタに渡した`lr`(この例では`0.1`)は実質無視され、初期学習率は`max_lr / div_factor`(`0.5 / 25 = 0.02`)から始まる(実行結果の先頭`0.02`と一致)。
+- `total_steps`を直接指定するか、`epochs`と`steps_per_epoch`の**両方**を指定するかのどちらかが必須(両方省略/両方指定はエラーになる)。`pct_start=0.3`(デフォルト)なので、全体の30%のステップで`max_lr`まで上昇し、残り70%で減衰する。
+
+### `torch.optim.lr_scheduler.ReduceLROnPlateau(...)`
+
+**用途**: 検証損失などの指標が`patience`エポック改善しなければ学習率を`factor`倍に減らす、指標駆動型のスケジューラ。他のスケジューラと異なり`step()`に**監視対象の値**を渡す。
+
+**シグネチャ**: `torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=10, threshold=0.0001, threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08)`
+
+**使用例**:
+```python
+lin3 = nn.Linear(2, 1)
+opt3 = torch.optim.SGD(lin3.parameters(), lr=0.1)
+sched3 = torch.optim.lr_scheduler.ReduceLROnPlateau(opt3, mode='min', factor=0.5, patience=1)
+losses = [1.0, 0.9, 0.95, 0.96, 0.5]
+lrs3 = []
+for loss in losses:
+    lrs3.append(opt3.param_groups[0]['lr'])
+    sched3.step(loss)
+lrs3.append(opt3.param_groups[0]['lr'])
+print(lrs3)
+```
+実行結果:
+```
+[0.1, 0.1, 0.1, 0.1, 0.05, 0.05]
+```
+
+**注意点・落とし穴**:
+- 他のスケジューラ(`StepLR`, `CosineAnnealingLR`など)は`scheduler.step()`を引数なしで呼ぶが、`ReduceLROnPlateau`は`scheduler.step(val_loss)`のように**監視する指標の値を渡す**必要がある(APIが非対称)。
+- この例では損失が`0.9`から`0.95`, `0.96`と2エポック連続で改善しなかった(`patience=1`を超えた)時点で学習率が`0.1 -> 0.05`に半減している。`mode='min'`(デフォルト)は値が小さいほど良いと解釈する。損失ではなく精度など大きいほど良い指標を監視する場合は`mode='max'`にする。
+
+---
+
+## 17. カスタムDataset/Sampler・torch.compile
+
+### `torch.utils.data.Dataset` を継承したカスタムデータセット
+
+**用途**: `TensorDataset`(9章)では表現できない、独自の読み込み・前処理ロジックを持つデータセットを定義する。`__len__`と`__getitem__`を実装すれば`DataLoader`にそのまま渡せる。
+
+**シグネチャ**: `class MyDataset(torch.utils.data.Dataset): def __len__(self) -> int: ...  def __getitem__(self, idx): ...`
+
+**使用例**:
+```python
+from torch.utils.data import Dataset, DataLoader
+
+class SquareDataset(Dataset):
+    def __init__(self, n):
+        self.data = torch.arange(n).float()
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        x = self.data[idx]
+        return x, x ** 2
+
+ds = SquareDataset(5)
+print(len(ds))
+print(ds[3])
+for x, y in DataLoader(ds, batch_size=2):
+    print(x, y)
+```
+実行結果:
+```
+5
+(tensor(3.), tensor(9.))
+tensor([0., 1.]) tensor([0., 1.])
+tensor([2., 3.]) tensor([4., 9.])
+tensor([4.]) tensor([16.])
+```
+
+**注意点・落とし穴**:
+- `__getitem__`は単一サンプルを返す実装でよく、バッチへのまとめ上げ(collate)は`DataLoader`が自動で行う(`torch.stack`相当の処理をデフォルトの`collate_fn`が担う)。
+- サンプル数(5)が`batch_size`(2)で割り切れないため、最後のバッチだけサイズ1になる(9章の`DataLoader`と同じ仕様)。
+
+### `torch.utils.data.WeightedRandomSampler(...)`
+
+**用途**: サンプルごとに異なる重みを設定し、重み付き復元抽出でバッチを構成する`Sampler`。クラス不均衡データのオーバーサンプリングによく使われる。
+
+**シグネチャ**: `WeightedRandomSampler(weights, num_samples, replacement=True, generator=None)`
+
+**使用例**:
+```python
+from torch.utils.data import WeightedRandomSampler
+
+weights = torch.tensor([0.1, 0.1, 0.1, 0.1, 10.0])
+sampler = WeightedRandomSampler(weights, num_samples=8, replacement=True, generator=torch.Generator().manual_seed(0))
+print(list(sampler))
+```
+実行結果:
+```
+[4, 4, 4, 4, 4, 4, 4, 4]
+```
+
+**注意点・落とし穴**:
+- インデックス4の重み(`10.0`)が他(`0.1`)の100倍あるため、8回抽出したサンプルが**すべて**インデックス4になった(極端な重み差を与えると起こりうる実際の挙動として確認済み)。重みは正規化不要(内部で確率に変換される)。
+- 独自の`Sampler`(`torch.utils.data.Sampler`を継承し`__iter__`/`__len__`を実装したクラス)を作ることもできるが、多くの場合`WeightedRandomSampler`や`SubsetRandomSampler`など標準実装で足りる。`DataLoader`に`sampler`を渡す場合は`shuffle`と同時指定できない(排他)点に注意。
+
+### `torch.compile(...)`
+
+**用途**: モデル・関数をJITコンパイルし実行を高速化する(PyTorch 2.x の目玉機能)。CPU環境でも動作することを確認した。
+
+**シグネチャ**: `torch.compile(model=None, *, fullgraph=False, dynamic=None, backend=None, mode=None, options=None, name=None, disable=False, recompile_limit=None, isolate_recompiles=False, shapes_spec=None)`
+
+**使用例**:
+```python
+import torch.nn as nn
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+
+def f(x):
+    return model(x) * 2
+
+compiled = torch.compile(f)
+x = torch.randn(3, 4)
+out = compiled(x)
+print("compiled output:", out)
+print("eager output:   ", f(x))
+print("allclose:", torch.allclose(compiled(x), f(x)))
+```
+実行結果:
+```
+compiled output: tensor([[-0.3894, -0.3003],
+        [ 0.3802, -0.0037],
+        [ 0.0088, -0.6827]], grad_fn=<CompiledFunctionBackward>)
+eager output:    tensor([[-0.3894, -0.3003],
+        [ 0.3802, -0.0037],
+        [ 0.0088, -0.6827]], grad_fn=<MulBackward0>)
+allclose: True
+```
+
+**注意点・落とし穴**:
+- CPU(CUDA無し)環境でも`torch.compile`は実行でき、eagerモードと数値的に一致する結果が得られることを確認した(`allclose: True`)。ただし本検証環境では速度計測は行っていない(高速化効果はGPUやより大きな計算グラフで顕著になることが一般的に知られているが、その定量比較はここでは未検証)。
+- コンパイル後の出力の`grad_fn`は`<CompiledFunctionBackward>`となり、eager実行時の`<MulBackward0>`とは異なる(内部でグラフ全体が1つの逆伝播関数にまとめられるため)。値は一致するが、`grad_fn`の名前で処理を分岐させるようなコードがあれば影響を受ける。
+- 初回呼び出し時にコンパイル(トレース)が走るため、その回だけ実行時間が長くなる(ウォームアップコストがある)。
+
+### `torch.nn.utils.clip_grad_norm_(...)`
+
+**用途**: 全パラメータの勾配をまとめて1つのベクトルとみなし、そのノルムが`max_norm`を超える場合に比例縮小する(勾配爆発対策。RNN/LSTMの学習で特に重要)。
+
+**シグネチャ**: `torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinite=False, foreach=None) -> Tensor`
+
+**使用例**:
+```python
+torch.manual_seed(0)
+lin = nn.Linear(3, 3)
+x = torch.randn(4, 3)
+loss = lin(x).sum() * 100  # 勾配を大きくするためスケールアップ
+loss.backward()
+total_norm_before = torch.norm(torch.stack([p.grad.norm() for p in lin.parameters()]))
+print("before:", total_norm_before)
+returned_norm = torch.nn.utils.clip_grad_norm_(lin.parameters(), max_norm=1.0)
+total_norm_after = torch.norm(torch.stack([p.grad.norm() for p in lin.parameters()]))
+print("returned:", returned_norm)
+print("after:", total_norm_after)
+```
+実行結果:
+```
+before: tensor(748.3250)
+returned: tensor(748.3250)
+after: tensor(1.0000)
+```
+
+**注意点・落とし穴**:
+- 関数名末尾の`_`が示す通り**in-place**で`.grad`を書き換える(戻り値はクリップ**前**の全体ノルムであり、クリップ後の値ではない。実行結果でも`returned`はクリップ前の`748.3250`と一致し、実際にクリップされた後のノルムは`after`の`1.0000`)。
+- 呼び出しタイミングは`loss.backward()`の**後**、`optimizer.step()`の**前**(勾配を計算し終えてから、パラメータ更新する前にクリップする)。
