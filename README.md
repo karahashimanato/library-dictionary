@@ -13,6 +13,11 @@ Python主要ライブラリの関数・API逆引き辞書。ライブラリご�
 | numpy | 2.4.6 | [numpy/README.md](numpy/README.md) |
 | pandas | 3.0.5 | [pandas/README.md](pandas/README.md) |
 | scikit-learn | 1.9.0 | [scikit-learn/README.md](scikit-learn/README.md) |
+| matplotlib | 3.11.1 | [matplotlib/README.md](matplotlib/README.md) |
+| scipy | 1.18.1 | [scipy/README.md](scipy/README.md) |
+| polars | 1.44.1 | [polars/README.md](polars/README.md) |
+| seaborn | 0.13.2 | [seaborn/README.md](seaborn/README.md) |
+| statsmodels | 0.14.6 | [statsmodels/README.md](statsmodels/README.md) |
 
 ## 運用ルール
 
