@@ -23,6 +23,10 @@ Python主要ライブラリの関数・API逆引き辞書。ライブラリご�
 | xgboost | 3.4.1 | [xgboost/README.md](xgboost/README.md) |
 | catboost | 1.2.10 | [catboost/README.md](catboost/README.md) |
 | lightgbm | 4.7.0 | [lightgbm/README.md](lightgbm/README.md) |
+| pytorch | 2.13.0 | [pytorch/README.md](pytorch/README.md) |
+| pymc | 6.3.1 | [pymc/README.md](pymc/README.md) |
+| pytensor | 3.3.0 | [pytensor/README.md](pytensor/README.md) |
+| jax | 0.11.1 | [jax/README.md](jax/README.md) |
 
 ## 運用ルール
 
