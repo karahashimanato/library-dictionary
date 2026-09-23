@@ -21,6 +21,15 @@ pandas 3.0.5 で検証済み(pandas 3.0以降の仕様変更に注意)
 10. [ピボット・reshape](#ピボットreshape)
 11. [型変換](#型変換)
 12. [その他便利メソッド](#その他便利メソッド)
+13. [応用・発展](#応用発展)
+    - [MultiIndex操作(高度な選択・スタック/アンスタック)](#multiindex操作高度な選択スタックアンスタック)
+    - [高度なウィンドウ関数(rolling/expanding/ewm)](#高度なウィンドウ関数rollingexpandingewm)
+    - [merge_asof/merge_ordered](#merge_asofmerge_ordered)
+    - [カテゴリカル型の高度な操作](#カテゴリカル型の高度な操作)
+    - [groupby.apply/transform/pipe/filterの使い分け](#groupbyapplytransformpipefilterの使い分け)
+    - [パフォーマンス・拡張型(eval/query, nullable dtype)](#パフォーマンス拡張型evalquery-nullable-dtype)
+    - [Styler(条件付き書式)](#styler条件付き書式)
+    - [高度なI/O(chunksize・SQL・to_parquet)](#高度なiochunksizesqlto_parquet)
 
 ---
 
@@ -1512,3 +1521,637 @@ print(df_assign.assign(b=lambda d: d["a"] * 2, c=lambda d: d["a"] + d["b"]))
 
 **注意点・落とし穴**:
 - `kwargs`内でラムダを使うと、同じ `assign()` 呼び出し内で直前に定義した列(この例の`b`)を後続の列(`c`)の計算に使える。
+
+---
+
+## 応用・発展
+
+より高度・ニッチなAPIを扱う。基本編と同様、すべて `/home/manaty/library-practicing/.venv/bin/python`(pandas 3.0.5)で実行検証済み。
+
+#### MultiIndex操作(高度な選択・スタック/アンスタック)
+
+### `pd.MultiIndex.from_tuples(...)`
+
+**用途**: 複数キーの組み合わせを階層的なインデックス(MultiIndex)として作成する。`groupby`や`pivot_table`の出力、複合キーを持つデータの表現に使われる。
+
+**シグネチャ**: `pd.MultiIndex.from_tuples(tuples, sortorder=None, names=None)`
+
+**使用例**:
+```python
+tuples = [("A", "x"), ("A", "y"), ("B", "x"), ("B", "y")]
+idx = pd.MultiIndex.from_tuples(tuples, names=["upper", "lower"])
+df_mi = pd.DataFrame({"val": [1, 2, 3, 4]}, index=idx)
+print(df_mi)
+```
+実行結果:
+```
+             val
+upper lower     
+A     x        1
+      y        2
+B     x        3
+      y        4
+```
+
+**注意点・落とし穴**:
+- 似たコンストラクタに `from_arrays`(階層ごとに別リストで渡す)や `from_product`(全組み合わせの直積を生成)があり、元データの持ち方に応じて使い分ける。
+
+### `df.xs(key, level=...)`
+
+**用途**: MultiIndexの特定階層に値を指定して断面(クロスセクション)を取得する。
+
+**シグネチャ**: `df.xs(key, axis=0, level=None, drop_level=True)`
+
+**使用例**:
+```python
+print(df_mi.xs("A", level="upper"))
+print(df_mi.xs("x", level="lower"))
+```
+実行結果:
+```
+       val
+lower     
+x        1
+y        2
+       val
+upper     
+A        1
+B        3
+```
+
+**注意点・落とし穴**:
+- デフォルト `drop_level=True` のため、指定した階層自体が結果のインデックスから消える。階層を残したい場合は `drop_level=False` を指定する。
+
+### `df.swaplevel(...)` / `df.reorder_levels(...)`
+
+**用途**: MultiIndexの階層の順序を入れ替える。
+
+**シグネチャ**: `df.swaplevel(i=-2, j=-1, axis=0)` / `df.reorder_levels(order, axis=0)`
+
+**使用例**:
+```python
+print(df_mi.swaplevel().sort_index())
+```
+実行結果:
+```
+             val
+lower upper     
+x     A        1
+      B        3
+y     A        2
+      B        4
+```
+
+**注意点・落とし穴**:
+- `swaplevel()` は並び替えのみでソートは行わない。見やすくするには続けて `sort_index()` を呼ぶことが多い。
+
+### `df.loc[pd.IndexSlice[...], :]`
+
+**用途**: MultiIndexの各階層に個別のスライス条件を指定して選択する。
+
+**シグネチャ**: `pd.IndexSlice`(プロパティ。`slice(None)` の代わりに `:` 記法を書けるようにするヘルパー)
+
+**使用例**:
+```python
+idx2 = pd.IndexSlice
+print(df_mi.loc[idx2[:, "y"], :])
+```
+実行結果:
+```
+             val
+upper lower     
+A     y        2
+B     y        4
+```
+
+**注意点・落とし穴**:
+- 列側の `, :` を省略して `df.loc[idx2[:, "y"]]` と書くと、2要素タプルが `(行, 列)` の指定と誤認識され `KeyError` になることがある(検証環境でも実際に `KeyError: 'y'` が発生した)。行だけを選択する場合でも列側の `:` を明示した方が安全。
+
+#### 高度なウィンドウ関数(rolling/expanding/ewm)
+
+### `s.rolling(window).apply(func, raw=True)`
+
+**用途**: 移動窓に対して組み込み以外の任意のPython関数を適用する。
+
+**シグネチャ**: `s.rolling(window).apply(func, raw=False, engine=None, args=None, kwargs=None)`
+
+**使用例**:
+```python
+s = pd.Series([1, 2, 3, 4, 5, 6])
+print(s.rolling(window=3).apply(lambda x: x.max() - x.min(), raw=True))
+```
+実行結果:
+```
+0    NaN
+1    NaN
+2    2.0
+3    2.0
+4    2.0
+5    2.0
+dtype: float64
+```
+
+**注意点・落とし穴**:
+- `raw=True` にすると各窓がSeriesではなくnumpy配列として渡され高速化される。Series固有のメソッド(`.index`など)を使わないなら `raw=True` を推奨。
+
+### `s.expanding(...)`
+
+**用途**: 先頭から現在行までの累積窓(件数が増え続ける窓)で集計する。
+
+**シグネチャ**: `s.expanding(min_periods=1, method='single')`
+
+**使用例**:
+```python
+print(s.expanding(min_periods=2).mean())
+```
+実行結果:
+```
+0    NaN
+1    1.5
+2    2.0
+3    2.5
+4    3.0
+5    3.5
+dtype: float64
+```
+
+### `s.ewm(...)`
+
+**用途**: 指数加重移動平均(直近の値ほど重みが大きい移動平均)を計算する。
+
+**シグネチャ**: `s.ewm(com=None, span=None, halflife=None, alpha=None, min_periods=0, adjust=True, ignore_na=False, times=None)`
+
+**使用例**:
+```python
+print(s.ewm(span=3, adjust=False).mean())
+```
+実行結果:
+```
+0    1.00000
+1    1.50000
+2    2.25000
+3    3.12500
+4    4.06250
+5    5.03125
+dtype: float64
+```
+
+**注意点・落とし穴**:
+- `adjust=False` は再帰的な定義(`y_t = (1-α)y_{t-1} + αx_t`)そのままの計算。デフォルトの `adjust=True` は初期値の重み付けを補正した別の計算式になり、同じ `span` でも序盤の値が変わる。
+
+### `s.rolling(window).corr(other)`
+
+**用途**: 2つのSeries間の移動窓相関係数を計算する(移動共分散は `.cov()`)。
+
+**シグネチャ**: `Rolling.corr(other=None, pairwise=None, ddof=1)`
+
+**使用例**:
+```python
+df_w = pd.DataFrame({"a": [1, 2, 3, 4, 5], "b": [5, 4, 3, 2, 1]})
+print(df_w["a"].rolling(3).corr(df_w["b"]))
+```
+実行結果:
+```
+0    NaN
+1    NaN
+2   -1.0
+3   -1.0
+4   -1.0
+dtype: float64
+```
+
+#### merge_asof/merge_ordered
+
+### `pd.merge_asof(...)`
+
+**用途**: 完全一致ではなく「直近の(最も近い)キー」で結合する。時系列データの非同期結合(例: 取引時刻に対する直近の気配値)でよく使う。
+
+**シグネチャ**: `pd.merge_asof(left, right, on=None, left_on=None, right_on=None, by=None, suffixes=('_x','_y'), tolerance=None, allow_exact_matches=True, direction='backward')`
+
+**使用例**:
+```python
+trades = pd.DataFrame({
+    "time": pd.to_datetime(["2024-01-01 09:00:01", "2024-01-01 09:00:05", "2024-01-01 09:00:10"]),
+    "price": [100, 101, 102],
+})
+quotes = pd.DataFrame({
+    "time": pd.to_datetime(["2024-01-01 09:00:00", "2024-01-01 09:00:03", "2024-01-01 09:00:08"]),
+    "quote": [99, 100, 101],
+})
+print(pd.merge_asof(trades, quotes, on="time", direction="backward"))
+```
+実行結果:
+```
+                 time  price  quote
+0 2024-01-01 09:00:01    100     99
+1 2024-01-01 09:00:05    101    100
+2 2024-01-01 09:00:10    102    101
+```
+
+**注意点・落とし穴**:
+- 両方の `on` 列は事前にソート済みである必要がある(未ソートだと誤った結果やエラーになりうる)。
+- `direction="backward"`(デフォルト)は「left側の時刻以下で直近のright」を選ぶ。`"forward"`/`"nearest"`も指定可能。
+
+### `pd.merge_ordered(...)`
+
+**用途**: キーでソートしながら結合する。`merge`と異なり、結合後も順序を保ちつつ前方補完などで欠損を埋めるオプションを持つ。
+
+**シグネチャ**: `pd.merge_ordered(left, right, on=None, left_on=None, right_on=None, fill_method=None, suffixes=('_x','_y'), how='outer')`
+
+**使用例**:
+```python
+left = pd.DataFrame({"k": [1, 3, 5], "lv": ["a", "b", "c"]})
+right = pd.DataFrame({"k": [1, 2, 3, 4], "rv": ["w", "x", "y", "z"]})
+print(pd.merge_ordered(left, right, on="k"))
+```
+実行結果:
+```
+   k   lv   rv
+0  1    a    w
+1  2  NaN    x
+2  3    b    y
+3  4  NaN    z
+4  5    c  NaN
+```
+
+**注意点・落とし穴**:
+- デフォルトの `how="outer"` は通常の `pd.merge` のデフォルト(`"inner"`)と異なる点に注意。
+
+#### カテゴリカル型の高度な操作
+
+### `pd.CategoricalDtype(categories, ordered=True)`
+
+**用途**: 順序付きカテゴリカル型を定義し、大小比較やソート順を制御する。
+
+**シグネチャ**: `pd.CategoricalDtype(categories=None, ordered=False)`
+
+**使用例**:
+```python
+s_cat = pd.Series(["low", "high", "mid", "low"]).astype(
+    pd.CategoricalDtype(categories=["low", "mid", "high"], ordered=True)
+)
+print(s_cat)
+print(s_cat[s_cat > "low"])
+```
+実行結果:
+```
+0     low
+1    high
+2     mid
+3     low
+dtype: category
+Categories (3, str): ['low' < 'mid' < 'high']
+1    high
+2     mid
+dtype: category
+Categories (3, str): ['low' < 'mid' < 'high']
+```
+
+**注意点・落とし穴**:
+- `ordered=True` にしないと `>` や `<` による比較は `TypeError` になる(順序なしカテゴリは大小比較不可)。
+
+### `s.cat` アクセサ(`codes` / `add_categories` / `reorder_categories`)
+
+**用途**: カテゴリカル型の内部コードやカテゴリ一覧を取得したり、カテゴリの追加・並び替えを行う。
+
+**シグネチャ**: `s.cat.codes`(プロパティ) / `s.cat.add_categories(new_categories)` / `s.cat.reorder_categories(new_categories, ordered=None)`
+
+**使用例**:
+```python
+print(s_cat.cat.codes)
+s_cat2 = s_cat.cat.add_categories(["extreme"])
+print(s_cat2.cat.categories)
+print(s_cat.cat.reorder_categories(["high", "mid", "low"], ordered=True))
+```
+実行結果:
+```
+0    0
+1    2
+2    1
+3    0
+dtype: int8
+Index(['low', 'mid', 'high', 'extreme'], dtype='str')
+0     low
+1    high
+2     mid
+3     low
+dtype: category
+Categories (3, str): ['high' < 'mid' < 'low']
+```
+
+**注意点・落とし穴**:
+- `s.cat.*` 系メソッドはすべて非破壊(新しいSeriesを返す)。元の `s_cat` のカテゴリ順は変わらない。
+
+### カテゴリ型によるメモリ削減
+
+**用途**: 重複の多い文字列列をカテゴリ型に変換してメモリ使用量を削減する。
+
+**シグネチャ**: `df.memory_usage(index=True, deep=False)`
+
+**使用例**:
+```python
+big = pd.Series(["A", "B", "C"] * 100000)
+print("str dtype:", big.memory_usage(deep=True))
+print("category dtype:", big.astype("category").memory_usage(deep=True))
+```
+実行結果:
+```
+str dtype: 2700132
+category dtype: 300160
+```
+
+**注意点・落とし穴**:
+- CSVなどdtype情報を保持しない形式に書き出すと、読み込み時にカテゴリ型は失われ通常の文字列型に戻る。カテゴリ型を維持したい場合はParquetやpickleなど型を保持できる形式で保存する。
+
+#### groupby.apply/transform/pipe/filterの使い分け
+
+### `df.groupby(...).apply(func)`
+
+**用途**: グループごとに任意の関数を適用する。戻り値の形状(スカラー/Series/DataFrame)に応じて結果の形が変わる、最も柔軟だが低速なグループ処理。
+
+**シグネチャ**: `df.groupby(...).apply(func, *args, include_groups=False, **kwargs)`
+
+**使用例**:
+```python
+df_g = pd.DataFrame({"team": ["A", "A", "B", "B"], "score": [10, 20, 30, 40]})
+print(df_g.groupby("team").apply(lambda g: g["score"].sum() - g["score"].min()))
+print(df_g.groupby("team").apply(lambda g: g.nlargest(1, "score")))
+```
+実行結果:
+```
+team
+A    20
+B    40
+dtype: int64
+        score
+team         
+A    1     20
+B    3     40
+```
+
+**注意点・落とし穴**:
+- pandas 3.0では `include_groups` のデフォルトが `False` になり、グループ化に使った列(この例の`team`)は関数に渡される部分DataFrame `g` から自動的に除外される(2つ目の実行結果に`team`列が出ていない)。以前は `True` がデフォルトで警告付きだったが、3.0で完全に切り替わった。
+- 戻り値が「元の行数と一致するSeries/DataFrame」になる処理なら `transform` の方が高速かつ意図が明確。
+
+### `df.groupby(...).filter(func)`
+
+**用途**: グループ全体を対象にした条件(例: グループ合計が閾値以上)でグループごと採用/除外する。
+
+**シグネチャ**: `df.groupby(...).filter(func, dropna=True, *args, **kwargs)`
+
+**使用例**:
+```python
+print(df_g.groupby("team").filter(lambda g: g["score"].sum() > 40))
+```
+実行結果:
+```
+  team  score
+2    B     30
+3    B     40
+```
+
+**注意点・落とし穴**:
+- `func` はグループ(DataFrame)を受け取り真偽値を1つ返す必要がある。`transform`/`apply`と違い、行の値自体は変えず「グループ単位の採否」だけを行う。
+
+### `df.pipe(func)` / `df.groupby(...).pipe(func)`
+
+**用途**: DataFrame(またはGroupByオブジェクト)をメソッドチェーンの中で任意の関数に渡す。`df.method()`形式ではない外部関数呼び出しをチェーンに組み込める。
+
+**シグネチャ**: `df.pipe(func, *args, **kwargs)`
+
+**使用例**:
+```python
+def add_col(d, colname, value):
+    return d.assign(**{colname: value})
+
+print(df_g.pipe(add_col, "flag", True))
+print(df_g.groupby("team").pipe(lambda g: g["score"].mean()))
+```
+実行結果:
+```
+  team  score  flag
+0    A     10  True
+1    A     20  True
+2    B     30  True
+3    B     40  True
+team
+A    15.0
+B    35.0
+Name: score, dtype: float64
+```
+
+**注意点・落とし穴**:
+- 使い分けの目安: 行数を変えず要素ごとの結果が欲しい→`transform`、グループごとに任意形状(集約・複数行・複数列いずれも)の結果が欲しい→`apply`、GroupByオブジェクトを含めて一連の処理をチェーンでつなげたい→`pipe`。
+
+#### パフォーマンス・拡張型(eval/query, nullable dtype)
+
+### `df.eval(expr)`
+
+**用途**: 文字列式でDataFrameの列演算を行い、新しい列を作ったり既存列を更新したりする。内部でnumexprエンジンを利用できる。
+
+**シグネチャ**: `df.eval(expr, *, inplace=False, **kwargs)`
+
+**使用例**:
+```python
+df_e = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+print(df_e.eval("c = a + b"))
+df_e.eval("d = a * 2", inplace=True)
+print(df_e)
+```
+実行結果:
+```
+   a  b  c
+0  1  4  5
+1  2  5  7
+2  3  6  9
+   a  b  d
+0  1  4  2
+1  2  5  4
+2  3  6  6
+```
+
+**注意点・落とし穴**:
+- `numexpr` がインストールされていれば自動的に使われ、中間配列の生成を抑えられるため大規模データで有利になることがある。ただし本検証環境で100万行の単純な演算(`x + y * z`)を計測すると、通常のベクトル化演算が約0.0058秒だったのに対し `df.eval` は約0.0316秒かかり、むしろ遅かった。「evalは常に速い」とは限らず、式の複雑さやデータ規模に応じて実測して判断すべき。
+
+### nullable dtype(`Int64` / `boolean`)と `pd.NA`
+
+**用途**: NumPyのネイティブ型と異なり欠損値を保持できる拡張整数・拡張真偽値型を使う(`df.convert_dtypes()`で得られる型と同じ系統)。
+
+**シグネチャ**: `pd.array(data, dtype="Int64")` / `pd.array(data, dtype="boolean")`
+
+**使用例**:
+```python
+s_nullable = pd.array([1, 2, None], dtype="Int64")
+print(s_nullable)
+print(s_nullable + 1)
+
+s_bool = pd.array([True, False, None], dtype="boolean")
+print(s_bool)
+print(s_bool & True)
+```
+実行結果:
+```
+<IntegerArray>
+[1, 2, <NA>]
+Length: 3, dtype: Int64
+<IntegerArray>
+[2, 3, <NA>]
+Length: 3, dtype: Int64
+<BooleanArray>
+[True, False, <NA>]
+Length: 3, dtype: boolean
+<BooleanArray>
+[True, False, <NA>]
+Length: 3, dtype: boolean
+```
+
+**注意点・落とし穴**:
+- 欠損混じりでも演算結果が `NaN`(float化)にならず、欠損を`<NA>`のまま整数/真偽値型で保持できる。`np.nan`ではなく`pd.NA`を使う点、通常の`bool`ではなく三値論理(`True`/`False`/`<NA>`)になる点に注意。
+
+### `df.memory_usage(deep=True)` とobject/str型の違い
+
+**用途**: 各列の実メモリ使用量を確認する。`deep=True`で可変長データ(文字列など)の実サイズまで含めて計測する。
+
+**シグネチャ**: `df.memory_usage(index=True, deep=False)`
+
+**使用例**:
+```python
+s_forced_object = pd.Series(["a" * 100] * 1000, dtype="str").astype(object)
+df_obj = pd.DataFrame({"s": s_forced_object})
+print(df_obj.memory_usage(deep=False))
+print(df_obj.memory_usage(deep=True))
+```
+実行結果:
+```
+Index     132
+s        8000
+dtype: int64
+Index       132
+s        149000
+dtype: int64
+```
+
+**注意点・落とし穴**:
+- `deep=False`は`object`列に対しては各要素へのポインタサイズ(8byte×件数)しか数えず、実際の文字列サイズを大きく過小評価する。`deep=True`で初めて実サイズが分かる。
+- pandas 3.0のデフォルト文字列型(`str`/`StringDtype`)の列は`deep`の有無にかかわらず実サイズに近い値を返す。過小評価が起きるのは明示的に`dtype=object`へキャストした列だけ。
+
+#### Styler(条件付き書式)
+
+### `df.style.highlight_max(...)` / `df.style.background_gradient(...)`
+
+**用途**: DataFrameの表示に条件付き書式(最大値のハイライト、値に応じたグラデーション背景など)を付ける。Jupyter上でそのまま表示できるほか、HTML出力もできる。
+
+**シグネチャ**: `Styler.highlight_max(subset=None, color='yellow', axis=0, props=None)` / `Styler.background_gradient(cmap='PuBu', low=0, high=0, axis=0, subset=None, ...)`
+
+**使用例**:
+```python
+df_style = pd.DataFrame({"a": [1, 5, 3], "b": [9, 2, 7]})
+styler = df_style.style.highlight_max(color="yellow")
+html = styler.to_html()
+print("background-color" in html)
+```
+実行結果:
+```
+True
+```
+
+**注意点・落とし穴**:
+- `df.style.xxx()` は `Styler` オブジェクトを返すだけで、`print()`しても通常のDataFrameのような表形式の文字列にはならない。書式を確認するにはJupyterでセルの最後に評価させるか `.to_html()` で出力する。
+
+### `df.style.format(...)` / `df.style.map(func)`
+
+**用途**: 表示上の数値フォーマット(桁数・単位など)を指定したり、セルごとの値に応じて任意のCSSスタイルを適用したりする。
+
+**シグネチャ**: `Styler.format(formatter=None, subset=None, na_rep=None, precision=None, decimal='.', thousands=None)` / `Styler.map(func, subset=None, **kwargs)`
+
+**使用例**:
+```python
+styler2 = df_style.style.format("{:.1f}").map(lambda v: "font-weight: bold" if v > 5 else "")
+html2 = styler2.to_html()
+print("9.0" in html2, "font-weight: bold" in html2)
+```
+実行結果:
+```
+True True
+```
+
+**注意点・落とし穴**:
+- pandas 3.0では旧来の `Styler.applymap()` は完全に廃止されており(呼び出すと `'Styler' object has no attribute 'applymap'` でエラーになることを検証環境で確認)、セル単位のスタイル適用は `map()` に統一されている。
+
+#### 高度なI/O(chunksize・SQL・to_parquet)
+
+### `pd.read_csv(..., chunksize=N)`
+
+**用途**: 大容量CSVを一度にメモリへ載せず、N行ずつのイテレータとして読み込む。
+
+**シグネチャ**: `pd.read_csv(filepath_or_buffer, chunksize=None, ...)`
+
+**使用例**:
+```python
+pd.DataFrame({"id": range(10), "val": range(10, 20)}).to_csv("/tmp/chunk_sample.csv", index=False)
+
+total = 0
+for chunk in pd.read_csv("/tmp/chunk_sample.csv", chunksize=4):
+    print("chunk shape:", chunk.shape)
+    total += chunk["val"].sum()
+print("total:", total)
+```
+実行結果:
+```
+chunk shape: (4, 2)
+chunk shape: (4, 2)
+chunk shape: (2, 2)
+total: 145
+```
+
+**注意点・落とし穴**:
+- 戻り値はDataFrameそのものではなく `TextFileReader`(イテレータ)。`for`ループや`next()`で1チャンクずつ処理する。
+
+### `df.to_sql(...)` / `pd.read_sql(...)`
+
+**用途**: DataFrameをSQLデータベースのテーブルとして書き込む/SQLクエリ結果をDataFrameとして読み込む。
+
+**シグネチャ**: `df.to_sql(name, con, *, schema=None, if_exists='fail', index=True, chunksize=None, method=None)` / `pd.read_sql(sql, con, index_col=None, params=None, chunksize=None)`
+
+**使用例**:
+```python
+import sqlite3
+con = sqlite3.connect(":memory:")
+df_sql = pd.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+df_sql.to_sql("mytable", con, index=False, if_exists="replace")
+print(pd.read_sql("SELECT * FROM mytable WHERE id > 1", con))
+```
+実行結果:
+```
+   id name
+0   2    b
+1   3    c
+```
+
+**注意点・落とし穴**:
+- pandas 3.0では `if_exists` に `"fail"`/`"replace"`/`"append"` に加えて `"delete_rows"`(テーブル構造は残したまま全行削除してから挿入)という選択肢が追加されている。
+- SQLAlchemy対応DB(PostgreSQLなど)だけでなく、標準ライブラリの`sqlite3`コネクションもそのまま渡せる。
+
+### `df.to_parquet(..., partition_cols=...)` / `pd.read_parquet(..., columns=...)`
+
+**用途**: Parquetをディレクトリ単位でパーティション分割して書き出す/読み込み時に必要な列だけ選択して読み込む(列指向フォーマットの利点を活かす)。
+
+**シグネチャ**: `df.to_parquet(path=None, *, engine='auto', partition_cols=None, ...)` / `pd.read_parquet(path, columns=None, filters=None, ...)`
+
+**使用例**:
+```python
+df_pq2 = pd.DataFrame({"year": [2023, 2023, 2024], "region": ["east", "west", "east"], "sales": [100, 200, 150]})
+df_pq2.to_parquet("/tmp/pq_partitioned", partition_cols=["year"])
+print(pd.read_parquet("/tmp/pq_partitioned", columns=["region", "sales"]))
+```
+実行結果:
+```
+  region  sales
+0   east    100
+1   west    200
+2   east    150
+```
+
+**注意点・落とし穴**:
+- `partition_cols`を指定すると`path`はファイルではなくディレクトリになり、内部に`year=2023/`のようなHiveスタイルのサブディレクトリが作られる。
+- `read_parquet(columns=...)`で列を絞り込むと、列指向フォーマットの特性上、指定していない列はディスクから読み込まれないため高速化・省メモリになる(CSVにはない利点)。

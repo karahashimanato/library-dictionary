@@ -16,6 +16,13 @@ scikit-learn 1.9.0 で検証済み。すべてのシグネチャ・実行結果�
 10. [評価指標](#10-評価指標)
 11. [パイプライン・ColumnTransformer](#11-パイプラインcolumntransformer)
 12. [その他ユーティリティ](#12-その他ユーティリティ)
+13. [応用・発展](#応用発展)
+    - [高度なパイプライン](#高度なパイプライン)
+    - [キャリブレーション・半教師あり学習](#キャリブレーション半教師あり学習)
+    - [マルチラベル・マルチ出力とカスタムスコアラー](#マルチラベルマルチ出力とカスタムスコアラー)
+    - [モデル解釈](#モデル解釈)
+    - [等張回帰・カーネル近似・多様体学習](#等張回帰カーネル近似多様体学習)
+    - [ガウス過程](#ガウス過程)
 
 ---
 
@@ -1605,3 +1612,490 @@ print(yr)
 
 **注意点・落とし穴**:
 - デフォルトは`replace=True`(重複を許す復元抽出=ブートストラップ)。単純に間引きたいだけの場合は`replace=False`を指定する。
+
+---
+
+## 応用・発展
+
+### 高度なパイプライン
+
+#### `FeatureUnion(...)`
+
+**用途**: 複数の変換器(Transformer)を並列に適用し、それぞれの出力を横に結合する。`Pipeline`が直列連結なのに対し、こちらは並列合成。
+
+**シグネチャ**: `sklearn.pipeline.FeatureUnion(transformer_list, *, n_jobs=None, transformer_weights=None, verbose=False, verbose_feature_names_out=True)`
+
+**使用例**:
+```python
+from sklearn.pipeline import FeatureUnion
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.datasets import load_iris
+X = load_iris().data
+fu = FeatureUnion([
+    ("pca", PCA(n_components=2, random_state=0)),
+    ("scaler", StandardScaler()),
+])
+Xf = fu.fit_transform(X)
+print(X.shape, "->", Xf.shape)
+```
+実行結果:
+```
+(150, 4) -> (150, 6)
+```
+
+**注意点・落とし穴**:
+- 各変換器の出力列数の合計が最終的な列数になる(PCAの2列 + StandardScalerの4列 = 6列)。列名の対応が分かりにくくなるため、`verbose_feature_names_out=True`(デフォルト)と`get_feature_names_out()`の併用が推奨される。
+- `ColumnTransformer`と違い、列を指定して振り分けることはできない(全変換器に同じ`X`全体が渡る)。列ごとに変換器を変えたい場合は`ColumnTransformer`を使う。
+
+#### カスタムTransformerの自作(`BaseEstimator`, `TransformerMixin`)
+
+**用途**: scikit-learnの`Pipeline`やGridSearchCVと互換性のある独自の前処理ステップを作る。
+
+**シグネチャ**: `class MyTransformer(BaseEstimator, TransformerMixin): def __init__(self, ...): ...; def fit(self, X, y=None): ...; def transform(self, X): ...`
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class ClipTransformer(BaseEstimator, TransformerMixin):
+    def __init__(self, lower=-1.0, upper=1.0):
+        self.lower = lower
+        self.upper = upper
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return np.clip(X, self.lower, self.upper)
+
+ct = ClipTransformer(lower=0.0, upper=6.0)
+Xc = ct.fit_transform(X)
+print(Xc.min(), Xc.max())
+print(ct.get_params())
+```
+実行結果:
+```
+0.1 6.0
+{'lower': 0.0, 'upper': 6.0}
+```
+
+**注意点・落とし穴**:
+- `__init__`は受け取った引数をそのまま同名の属性に代入するだけにする(加工禁止)。これを破ると`BaseEstimator`が提供する`get_params()`/`set_params()`(`GridSearchCV`のパラメータ探索が依存する)が正しく動作しない。
+- `TransformerMixin`を継承すると`fit`と`transform`から自動的に`fit_transform`が合成される(自分で`fit_transform`を書く必要はない)。
+
+#### `set_output(...)`
+
+**用途**: 変換器の`transform`/`fit_transform`の出力形式を、numpy配列ではなくpandas DataFrameに固定する。
+
+**シグネチャ**: `Estimator.set_output(self, *, transform=None) -> Estimator`(`TransformerMixin`を継承する変換器全般が持つメソッド)
+
+**使用例**:
+```python
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+df = pd.DataFrame(X, columns=["a", "b", "c", "d"])
+sc = StandardScaler().set_output(transform="pandas")
+out = sc.fit_transform(df)
+print(type(out))
+print(out.head(2))
+```
+実行結果:
+```
+<class 'pandas.DataFrame'>
+          a         b         c         d
+0 -0.900681  1.019004 -1.340227 -1.315444
+1 -1.143017 -0.131979 -1.340227 -1.315444
+```
+
+**注意点・落とし穴**:
+- 列名は入力DataFrameの列名(または`get_feature_names_out()`の結果)がそのまま使われる。numpy配列を渡した場合は`x0`, `x1`, ...のような自動生成名になる。
+- `sklearn.set_config(transform_output="pandas")`でグローバルに全変換器のデフォルトを変更することもできる(個別に`set_output`を呼ばずに済む)。
+
+### キャリブレーション・半教師あり学習
+
+#### `CalibratedClassifierCV(...)`
+
+**用途**: 分類器の出力確率を、実際の事象発生率に近づくよう較正(キャリブレーション)する。`SVC`のように確率出力が不得意なモデルの`predict_proba`を改善する目的でよく使う。
+
+**シグネチャ**: `sklearn.calibration.CalibratedClassifierCV(estimator=None, *, method='sigmoid', cv=None, n_jobs=None, ensemble='auto')`
+
+**使用例**:
+```python
+from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.datasets import load_iris
+from sklearn.model_selection import train_test_split
+X, y = load_iris(return_X_y=True)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0)
+base = SVC(kernel="rbf", random_state=0)
+cal = CalibratedClassifierCV(base, method="sigmoid", cv=3)
+cal.fit(Xtr, ytr)
+print("predict_proba[0]:", cal.predict_proba(Xte[:1]).round(3))
+print("score:", cal.score(Xte, yte))
+```
+実行結果:
+```
+predict_proba[0]: [[0.037 0.091 0.872]]
+score: 0.9777777777777777
+```
+
+**注意点・落とし穴**:
+- README冒頭の`SVC`の項で触れたとおり、`SVC(probability=True)`は1.9で非推奨。確率出力が必要なら`SVC(probability=True)`ではなく本項の`CalibratedClassifierCV(SVC(), ...)`を使うようscikit-learn側からも案内される。
+- `method='sigmoid'`(Platt scaling、データが少ない場合向け)と`method='isotonic'`(データが多い場合向け、後述の`IsotonicRegression`を内部で使用)の2種類がある。データが少ないのに`'isotonic'`を使うと過学習しやすい。
+- 内部で`cv`分割ごとにベースモデルを学習し直すため、単純な`fit`よりコストが高い。
+
+#### `LabelPropagation(...)` / `LabelSpreading(...)`
+
+**用途**: ラベル付きデータとラベルなしデータが混在する半教師あり学習で、ラベルなしサンプルにラベルを伝播させる。
+
+**シグネチャ**: `sklearn.semi_supervised.LabelPropagation(kernel='rbf', *, gamma=20, n_neighbors=7, max_iter=1000, tol=0.001, n_jobs=None)`
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.semi_supervised import LabelPropagation
+from sklearn.datasets import load_iris
+X, y = load_iris(return_X_y=True)
+rng = np.random.RandomState(0)
+y_semi = y.copy()
+unlabeled_idx = rng.choice(len(y), size=60, replace=False)
+y_semi[unlabeled_idx] = -1
+print("labeled count:", (y_semi != -1).sum(), "/ total:", len(y_semi))
+lp = LabelPropagation()
+lp.fit(X, y_semi)
+print("score on true y:", lp.score(X, y))
+```
+実行結果:
+```
+labeled count: 90 / total: 150
+score on true y: 0.98
+```
+
+**注意点・落とし穴**:
+- ラベルなしサンプルは`-1`で表す決まりになっている(欠損値NaNではない)。
+- `LabelSpreading`は`LabelPropagation`と似ているが、ラベル伝播時にノイズへの頑健性を高める`alpha`(正則化)パラメータを持つ点が異なる(`LabelPropagation`にはない)。
+
+#### `SelfTrainingClassifier(...)`
+
+**用途**: 任意の`predict_proba`を持つ分類器をベースに、確信度の高いラベルなしサンプルを繰り返し取り込みながら学習する半教師あり学習のラッパー。
+
+**シグネチャ**: `sklearn.semi_supervised.SelfTrainingClassifier(estimator=None, threshold=0.75, criterion='threshold', k_best=10, max_iter=10, verbose=False)`
+
+**使用例**:
+```python
+from sklearn.semi_supervised import SelfTrainingClassifier
+from sklearn.linear_model import LogisticRegression
+base_clf = LogisticRegression(max_iter=1000)
+st = SelfTrainingClassifier(base_clf, threshold=0.8)
+st.fit(X, y_semi)
+print("score:", st.score(X, y))
+print("n_iter_:", st.n_iter_)
+```
+実行結果:
+```
+score: 0.9533333333333334
+n_iter_: 5
+```
+
+**注意点・落とし穴**:
+- `LabelPropagation`と違い、任意の分類器(`predict_proba`があるもの)をベースにできる汎用ラッパー。`-1`ラベルの扱いは`LabelPropagation`と共通。
+- `threshold`(デフォルト0.75)以上の確信度を持つ予測だけを次のイテレーションで正解ラベルとして取り込む。閾値が低すぎると誤ったラベルが混入し、高すぎると学習が進まないまま`max_iter`に達する。
+
+### マルチラベル・マルチ出力とカスタムスコアラー
+
+#### `MultiOutputClassifier(...)` / `MultiOutputRegressor(...)`
+
+**用途**: 単一出力しか扱えない分類器・回帰器を、目的変数が複数列(マルチ出力)のタスクに拡張する。内部では出力列ごとに独立したモデルを学習する。
+
+**シグネチャ**: `sklearn.multioutput.MultiOutputClassifier(estimator, *, n_jobs=None)` / `sklearn.multioutput.MultiOutputRegressor(estimator, *, n_jobs=None)`
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.datasets import make_classification
+Xm, y1 = make_classification(n_samples=200, n_features=6, n_classes=2, random_state=0)
+rng = np.random.RandomState(0)
+y2 = rng.randint(0, 3, size=200)
+Ym = np.column_stack([y1, y2])
+moc = MultiOutputClassifier(RandomForestClassifier(n_estimators=50, random_state=0))
+moc.fit(Xm, Ym)
+print(moc.predict(Xm[:5]))
+print("score:", moc.score(Xm, Ym))
+```
+実行結果:
+```
+[[0 0]
+ [1 1]
+ [1 0]
+ [1 1]
+ [1 1]]
+score: 0.995
+```
+
+**注意点・落とし穴**:
+- 出力列ごとに完全に独立したモデルが学習されるため、出力間の相関(依存関係)は考慮されない。出力間の依存を利用したい場合は分類なら`ClassifierChain`を使う。
+- `RandomForestClassifier`や`DecisionTreeClassifier`など一部の推定器はもともとマルチ出力に対応しており、その場合`MultiOutputClassifier`で包む必要はない。
+- `MultiOutputRegressor`も同様の考え方で、`Ridge`のようにネイティブに`n_targets`をサポートしない回帰器を多出力対応にする。
+
+#### `ClassifierChain(...)`
+
+**用途**: マルチラベル分類で、各ラベルの予測器を鎖状につなぎ、前のラベルの予測結果を次のラベルの入力特徴量に追加することでラベル間の依存関係を利用する。
+
+**シグネチャ**: `sklearn.multioutput.ClassifierChain(estimator, *, order=None, cv=None, chain_method='predict', random_state=None, verbose=False)`
+
+**使用例**:
+```python
+from sklearn.multioutput import ClassifierChain
+from sklearn.linear_model import LogisticRegression
+Xc, Yc = make_classification(n_samples=200, n_features=6, n_classes=2, random_state=0)
+Yc2 = np.column_stack([Yc, rng.randint(0, 2, size=200), rng.randint(0, 2, size=200)])
+cc = ClassifierChain(LogisticRegression(max_iter=1000), order="random", random_state=0)
+cc.fit(Xc, Yc2)
+print(cc.predict(Xc[:3]))
+```
+実行結果:
+```
+[[0. 1. 0.]
+ [1. 1. 0.]
+ [1. 0. 1.]]
+```
+
+**注意点・落とし穴**:
+- `order="random"`(または明示的な順序リスト)でラベルを処理する順序を制御できる。順序によって精度が変わりうるため、`order=None`(デフォルト、入力順)で満足できない場合は複数の`ClassifierChain`をアンサンブルするのが一般的。
+- `cv=None`(デフォルト)だと学習時に自分自身の予測(訓練データに対する予測)を次のラベルの特徴量として使うため、過学習(楽観的な連鎖)になりやすい。`cv`に整数を指定すると交差検証予測を使うため、より汎化した鎖になる。
+
+#### `make_scorer(...)` とネストされた交差検証
+
+**用途**: `make_scorer`は任意の評価関数(`fbeta_score`など)を`GridSearchCV`/`cross_val_score`の`scoring`引数に渡せる形に変換する。ネストされた交差検証は、ハイパーパラメータ探索(内側CV)とモデル評価(外側CV)を分離し、探索によるスコアの楽観バイアスを避ける手法。
+
+**シグネチャ**: `sklearn.metrics.make_scorer(score_func, *, response_method='predict', greater_is_better=True, **kwargs)`
+
+**使用例**:
+```python
+from sklearn.metrics import make_scorer, fbeta_score
+from sklearn.model_selection import cross_val_score, GridSearchCV, KFold
+from sklearn.svm import SVC
+from sklearn.datasets import load_iris
+X, y = load_iris(return_X_y=True)
+
+f2_scorer = make_scorer(fbeta_score, beta=2, average="macro")
+scores = cross_val_score(SVC(), X, y, scoring=f2_scorer, cv=5)
+print("f2 scores:", scores.round(3))
+
+inner_cv = KFold(n_splits=3, shuffle=True, random_state=0)
+outer_cv = KFold(n_splits=3, shuffle=True, random_state=1)
+clf = GridSearchCV(SVC(), {"C": [0.1, 1, 10]}, cv=inner_cv)
+nested_scores = cross_val_score(clf, X, y, cv=outer_cv)
+print("nested scores:", nested_scores.round(3))
+```
+実行結果:
+```
+f2 scores: [0.966 0.966 0.966 0.933 1.   ]
+nested scores: [0.98 0.96 0.94]
+```
+
+**注意点・落とし穴**:
+- `make_scorer`に渡す`**kwargs`(この例では`beta=2`)は`score_func`の呼び出し時に固定引数として渡される。`greater_is_better=False`にすると内部でスコアの符号が反転される(誤差指標を「大きいほど良い」形式に揃えるため)。
+- ネストされた交差検証では、`GridSearchCV`自体を`cross_val_score`の`estimator`として渡すのがポイント。こうすることで外側の各foldごとに独立したハイパーパラメータ探索が行われ、「最良パラメータを選ぶ」という行為そのものが評価スコアに漏れ込むのを防げる。外側CVを使わず単純に`gs.best_score_`だけを報告すると、探索空間が広いほどスコアが楽観的になりやすい。
+
+### モデル解釈
+
+#### `permutation_importance(...)`
+
+**用途**: 特徴量の値をランダムにシャッフルしたときのスコア低下量から、モデル非依存に特徴量重要度を推定する。
+
+**シグネチャ**: `sklearn.inspection.permutation_importance(estimator, X, y, *, scoring=None, n_repeats=5, n_jobs=None, random_state=None, sample_weight=None, max_samples=1.0)`
+
+**使用例**:
+```python
+from sklearn.inspection import permutation_importance
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.datasets import load_iris
+X, y = load_iris(return_X_y=True)
+rf = RandomForestClassifier(n_estimators=100, random_state=0).fit(X, y)
+r = permutation_importance(rf, X, y, n_repeats=10, random_state=0)
+print("importances_mean:", r.importances_mean.round(3))
+print("importances_std:", r.importances_std.round(3))
+```
+実行結果:
+```
+importances_mean: [0.016 0.011 0.289 0.181]
+importances_std: [0.005 0.007 0.028 0.025]
+```
+
+**注意点・落とし穴**:
+- `RandomForestClassifier.feature_importances_`(不純度ベースの重要度)とは計算方法が異なり、値も一致しない。不純度ベースの重要度は連続値・高カーディナリティな特徴量を過大評価しやすいが、`permutation_importance`はその影響を受けにくい。
+- 学習データで計算すると重要度が過大評価されがちなので、可能であれば検証用データ(未使用データ)に対して計算する方が汎化性能への寄与をより正しく反映する。
+- 相関の強い特徴量同士があると、片方をシャッフルしてももう片方から情報を補えてしまい、重要度が実際より低く出ることがある。
+
+#### `partial_dependence(...)`
+
+**用途**: 他の特徴量を平均化しつつ、対象の特徴量を動かしたときに予測がどう変化するか(部分依存)を計算する。
+
+**シグネチャ**: `sklearn.inspection.partial_dependence(estimator, X, features, *, sample_weight=None, categorical_features=None, feature_names=None, response_method='auto', percentiles=(0.05, 0.95), grid_resolution=100, custom_values=None, method='auto', kind='average')`
+
+**使用例**:
+```python
+from sklearn.inspection import partial_dependence
+pd_result = partial_dependence(rf, X, features=[2], grid_resolution=5)
+print(pd_result["average"].round(3))
+print(pd_result["grid_values"][0].round(3))
+```
+実行結果:
+```
+[[0.658 0.407 0.165 0.163 0.159]
+ [0.239 0.434 0.623 0.47  0.174]
+ [0.103 0.159 0.212 0.367 0.667]]
+[1.3 2.5 3.7 4.9 6.1]
+```
+
+**注意点・落とし穴**:
+- 戻り値は辞書ライク(`Bunch`)で、`"average"`が予測値、`"grid_values"`が評価点。多クラス分類(この例ではiris3クラス)では`"average"`の各行がクラスごとの部分依存になる(3行×5グリッド点)。
+- 可視化したい場合は`sklearn.inspection.PartialDependenceDisplay.from_estimator(...)`を使うと本関数を内部で呼びつつグラフ化してくれる。
+- 特徴量間の相関を無視して「他の特徴量を固定/平均化」するため、強く相関する特徴量が存在すると非現実的な(データに存在しない)組み合わせで評価してしまう場合がある。
+
+### 等張回帰・カーネル近似・多様体学習
+
+#### `IsotonicRegression(...)`
+
+**用途**: 単調性(増加または減少)のみを仮定してxとyの関係をノンパラメトリックに近似する回帰。確率較正(`CalibratedClassifierCV(method='isotonic')`)の内部でも使われる。
+
+**シグネチャ**: `sklearn.isotonic.IsotonicRegression(*, y_min=None, y_max=None, increasing=True, out_of_bounds='nan')`
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.isotonic import IsotonicRegression
+x_iso = np.array([1, 2, 3, 4, 5, 6, 7])
+y_iso = np.array([1, 0.9, 2.1, 2.0, 3.5, 3.2, 5.0])
+ir = IsotonicRegression()
+y_pred = ir.fit_transform(x_iso, y_iso)
+print(y_pred.round(3))
+```
+実行結果:
+```
+[0.95 0.95 2.05 2.05 3.35 3.35 5.  ]
+```
+
+**注意点・落とし穴**:
+- 入力`x`は1次元のみ対応(多変量の特徴量には使えない)。
+- 出力は入力どおりの単調非減少(`increasing=True`がデフォルト)列になる。この例では逆転していた2番目・4番目のペア(0.9<1、2.0<2.1)がそれぞれ平均され隣接値と同じ値(0.95, 2.05)に均されている。
+- 学習データの範囲外の`x`を`predict`すると、`out_of_bounds='nan'`(デフォルト)によりNaNが返る。
+
+#### `Nystroem(...)` / `RBFSampler(...)`
+
+**用途**: カーネル法(SVMのカーネルトリックなど)を、明示的な低次元特徴量への写像で近似する。`SGDClassifier`のような線形モデルと組み合わせることで、非線形な決定境界を高速に学習できる。
+
+**シグネチャ**: `sklearn.kernel_approximation.Nystroem(kernel='rbf', *, gamma=None, coef0=None, degree=None, kernel_params=None, n_components=100, random_state=None, n_jobs=None)` / `sklearn.kernel_approximation.RBFSampler(*, gamma=1.0, n_components=100, random_state=None)`
+
+**使用例**:
+```python
+from sklearn.kernel_approximation import Nystroem, RBFSampler
+from sklearn.linear_model import SGDClassifier
+from sklearn.datasets import load_iris
+X, y = load_iris(return_X_y=True)
+
+ny = Nystroem(kernel="rbf", gamma=0.2, random_state=0, n_components=50)
+X_ny = ny.fit_transform(X)
+print(X.shape, "->", X_ny.shape)
+clf = SGDClassifier(max_iter=1000, random_state=0).fit(X_ny, y)
+print("score:", clf.score(X_ny, y))
+
+rbf = RBFSampler(gamma=0.2, random_state=0, n_components=50)
+X_rbf = rbf.fit_transform(X)
+print(X.shape, "->", X_rbf.shape)
+```
+実行結果:
+```
+(150, 4) -> (150, 50)
+score: 0.9733333333333334
+(150, 4) -> (150, 50)
+```
+
+**注意点・落とし穴**:
+- `Nystroem`は学習データの一部をサンプリングして基底を作る(データ依存)のに対し、`RBFSampler`はランダムフーリエ特徴量によりデータに依存せず近似する。一般に同じ`n_components`なら`Nystroem`の方が近似精度が高い傾向がある。
+- `n_components`(近似の次元数)を増やすほど元のカーネル法の精度に近づくが、計算コストも増える。
+- `gamma`は元の`SVC(kernel='rbf')`の`gamma`と同じ役割で、値の選び方が結果に大きく影響する。
+
+#### `Isomap(...)` / `LocallyLinearEmbedding(...)`
+
+**用途**: データが低次元多様体上に分布しているという仮定のもとで非線形に次元削減する(多様体学習)。`TSNE`と同様に可視化や特徴抽出に使うが、こちらは(条件付きで)新規データへの`transform`が可能。
+
+**シグネチャ**: `sklearn.manifold.Isomap(*, n_neighbors=5, radius=None, n_components=2, eigen_solver='auto', tol=0, max_iter=None, path_method='auto', neighbors_algorithm='auto', n_jobs=None, metric='minkowski', p=2, metric_params=None)` / `sklearn.manifold.LocallyLinearEmbedding(*, n_neighbors=5, n_components=2, reg=0.001, eigen_solver='auto', tol=1e-06, max_iter=100, method='standard', hessian_tol=0.0001, modified_tol=1e-12, neighbors_algorithm='auto', random_state=None, n_jobs=None)`
+
+**使用例**:
+```python
+from sklearn.manifold import Isomap, LocallyLinearEmbedding
+from sklearn.datasets import load_iris
+X, y = load_iris(return_X_y=True)
+
+iso = Isomap(n_neighbors=10, n_components=2)
+X_iso = iso.fit_transform(X)
+print(X_iso.shape)
+print(X_iso[:3].round(3))
+
+lle = LocallyLinearEmbedding(n_neighbors=10, n_components=2, random_state=0)
+X_lle = lle.fit_transform(X)
+print(X_lle.shape)
+print("reconstruction_error_:", round(lle.reconstruction_error_, 6))
+```
+実行結果:
+```
+(150, 2)
+[[-3.148 -0.119]
+ [-3.288 -0.135]
+ [-3.53  -0.154]]
+(150, 2)
+reconstruction_error_: 0.0
+```
+
+**注意点・落とし穴**:
+- 実行時に `UserWarning: The number of connected components of the neighbors graph is 2 > 1. ...` が出ることを実際に確認した。irisデータではk近傍グラフが1つに繋がらない(孤立したクラスタができる)ことがあり、`n_neighbors`を増やして解消するか、警告を許容するかの判断が必要。
+- `TSNE`と異なり両クラスとも`fit`済みのオブジェクトで新しい点に対する`transform`が可能(ただし`TSNE`同様、絶対座標やスケールに直接的な意味はない)。
+- `LocallyLinearEmbedding`の`reconstruction_error_`は近傍からの線形再構成誤差。0に近いほど近傍構造をよく保てている(この例のように0.0近辺になることもある)。
+
+### ガウス過程
+
+#### `GaussianProcessClassifier(...)` / `GaussianProcessRegressor(...)`
+
+**用途**: ガウス過程による確率的な分類・回帰。予測の不確実性(標準偏差)を自然な形で得られるのが最大の特徴。
+
+**シグネチャ**: `sklearn.gaussian_process.GaussianProcessClassifier(kernel=None, *, optimizer='fmin_l_bfgs_b', n_restarts_optimizer=0, max_iter_predict=100, warm_start=False, copy_X_train=True, random_state=None, multi_class='one_vs_rest', n_jobs=None)` / `sklearn.gaussian_process.GaussianProcessRegressor(kernel=None, *, alpha=1e-10, optimizer='fmin_l_bfgs_b', n_restarts_optimizer=0, normalize_y=False, copy_X_train=True, n_targets=None, random_state=None)`
+
+**使用例**:
+```python
+from sklearn.gaussian_process import GaussianProcessClassifier, GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF
+from sklearn.model_selection import train_test_split
+from sklearn.datasets import load_iris, make_regression
+
+X, y = load_iris(return_X_y=True)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0)
+gpc = GaussianProcessClassifier(kernel=1.0 * RBF(1.0), random_state=0)
+gpc.fit(Xtr, ytr)
+print("score:", gpc.score(Xte, yte))
+print("predict_proba[0]:", gpc.predict_proba(Xte[:1]).round(3))
+
+Xr, yr = make_regression(n_samples=50, n_features=1, noise=5.0, random_state=0)
+gpr = GaussianProcessRegressor(kernel=1.0 * RBF(1.0), random_state=0, normalize_y=True)
+gpr.fit(Xr, yr)
+mean, std = gpr.predict(Xr[:3], return_std=True)
+print("mean:", mean.round(2))
+print("std:", std.round(2))
+```
+実行結果:
+```
+score: 0.9777777777777777
+predict_proba[0]: [[0.184 0.09  0.726]]
+mean: [-22.21  26.85 -12.76]
+std: [0. 0. 0.]
+```
+
+**注意点・落とし穴**:
+- `GaussianProcessRegressor`の`predict`に`return_std=True`を渡すと予測の標準偏差(不確実性)も得られる。この例のように学習に使った点そのものを予測すると、デフォルトの`alpha=1e-10`(観測ノイズがほぼ0という仮定)のためほぼ完全に補間し、`std`が0近くになる。ノイズのあるデータでは`alpha`を大きくするか、`kernel`に`WhiteKernel`を加える。
+- `GaussianProcessClassifier`実行時に`ConvergenceWarning: The optimal value found for dimension 0 of parameter k2__length_scale is close to the specified lower bound...`が実際に出た。カーネルのハイパーパラメータ最適化が探索範囲の境界に張り付いている合図で、`RBF(length_scale_bounds=...)`で範囲を広げるなどの対処が有効。
+- 計算量がサンプル数の3乗のオーダーで増える(内部でカーネル行列の逆行列を計算するため)。数千サンプルを超えるデータには不向き。

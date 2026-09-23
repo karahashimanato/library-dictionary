@@ -15,6 +15,15 @@ matplotlib 3.11.1 で検証済み(すべてのシグネチャ・出力は `/home
 9. [保存・表示](#保存表示)
 10. [スタイル・テーマ(rcParams)](#スタイルテーマrcparams)
 11. [その他](#その他)
+12. [応用・発展](#応用発展)
+    - [高度なレイアウト](#高度なレイアウト)
+    - [アニメーション](#アニメーション)
+    - [カスタムカラーマップ作成](#カスタムカラーマップ作成)
+    - [パスエフェクト](#パスエフェクト)
+    - [イベント処理](#イベント処理)
+    - [Patches・Collections](#patchescollections)
+    - [カスタム目盛りフォーマッタ](#カスタム目盛りフォーマッタ)
+    - [座標変換](#座標変換)
 
 ---
 
@@ -1247,3 +1256,578 @@ print(list(ax.spines.keys()))
 
 **注意点・落とし穴**:
 - `ax.spines` は辞書のように `["top"]`, `["right"]`, `["left"]`, `["bottom"]` の4キーでアクセスするオブジェクト(`Spines` クラス)。`ax.spines.top` のような属性アクセスも可能だが、キー名を間違えると `KeyError` になる。
+
+---
+
+## 応用・発展
+
+より高度・ニッチな matplotlib API を扱う(基本プロット・レイアウト・軸設定などは上記の各節を参照)。
+
+### 高度なレイアウト
+
+#### `plt.subplots(..., layout="constrained")`
+
+**用途**: `tight_layout()` より高精度にタイトル・ラベル・カラーバーの重なりを解消する新しいレイアウトエンジン(`constrained`)を有効にする。
+
+**シグネチャ**: `Figure.__init__(self, figsize=None, dpi=None, *, facecolor=None, edgecolor=None, linewidth=0.0, frameon=None, subplotpars=None, tight_layout=None, constrained_layout=None, layout=None, **kwargs)` の `layout` 引数(`plt.subplots(..., layout="constrained")` のように `fig_kw` 経由で渡す)。動的に切り替えるには `Figure.set_layout_engine(self, layout=None, **kwargs)` も使える。
+
+**使用例**:
+```python
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(4, 3), layout="constrained")
+axes[0].set_title("long title that might overlap")
+axes[1].set_ylabel("very long ylabel text")
+fig.savefig("48_constrained_layout.png")
+```
+実行結果: `layout="constrained"` を指定しても、Figure サイズ (4, 3) に対してタイトル文字列が長すぎるため、依然としてタイトルの左端("lo"の部分)が図の外に切れて "ng title that might overlap" としか表示されない実例を確認した(右側の Axes の ylabel は重なりなく収まっている)。`constrained_layout`/`layout="constrained"` は `tight_layout()` より賢いが、極端に小さい `figsize` では万能ではない。
+
+**注意点・落とし穴**:
+- `plt.subplots(..., constrained_layout=True)` という旧来の書き方も動くが、`layout="constrained"` が現在推奨される書き方(内部的には同じレイアウトエンジンを使う)。
+- `fig.subplots_adjust(...)` や `fig.tight_layout()` と併用すると、constrained レイアウトエンジンが自動的に無効化される(競合を避けるための仕様)。
+
+---
+
+#### `fig.subfigures(...)`
+
+**用途**: 1つの Figure を複数の「サブFigure」に分割し、それぞれが独立した `suptitle`・背景色・さらにネストした `subplots` を持てるようにする(複数の異なるグループのプロットを1枚の図にまとめたい場合に便利)。
+
+**シグネチャ**: `Figure.subfigures(self, nrows=1, ncols=1, squeeze=True, wspace=None, hspace=None, width_ratios=None, height_ratios=None, **kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+fig = plt.figure(figsize=(6, 4))
+subfigs = fig.subfigures(1, 2, wspace=0.1)
+subfigs[0].suptitle("Left group")
+axesL = subfigs[0].subplots(2, 1)
+axesL[0].plot(np.arange(5))
+axesL[1].plot(np.arange(5)[::-1])
+subfigs[1].suptitle("Right group")
+axR = subfigs[1].subplots(1, 1)
+axR.scatter(np.arange(5), np.arange(5))
+fig.savefig("49_subfigures.png")
+```
+実行結果: 左側のサブFigureに "Left group" という見出しの下に2つの折れ線グラフ(縦に並ぶ)、右側のサブFigureに "Right group" という見出しの下に1つの散布図が配置された図が生成される。左右のグループでそれぞれ独立した `suptitle` を持てることを確認した。
+
+**注意点・落とし穴**:
+- `subfigures()` が返すのは通常の `Axes` ではなく `SubFigure` オブジェクト。`SubFigure` はさらに `.subplots(...)` や `.add_subplot(...)` を呼んで初めて実際に描画可能な `Axes` を持つ、Figureのようなコンテナである点が `add_gridspec`/`subplot_mosaic` との違い。
+
+---
+
+#### `matplotlib.gridspec.GridSpecFromSubplotSpec(...)`
+
+**用途**: 既存の `GridSpec` の1マス(`SubplotSpec`)の中をさらに分割し、入れ子(ネスト)状のグリッドレイアウトを作る。
+
+**シグネチャ**: `GridSpecFromSubplotSpec(self, nrows, ncols, subplot_spec, wspace=None, hspace=None, height_ratios=None, width_ratios=None)`
+
+**使用例**:
+```python
+from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+import numpy as np
+
+fig = plt.figure(figsize=(6, 4))
+gs = GridSpec(1, 2, figure=fig, width_ratios=[1, 2])
+ax_left = fig.add_subplot(gs[0, 0])
+ax_left.set_title("left (single)")
+ax_left.plot(np.arange(5))
+
+inner = GridSpecFromSubplotSpec(2, 2, subplot_spec=gs[0, 1], wspace=0.4, hspace=0.4)
+for i in range(4):
+    ax = fig.add_subplot(inner[i // 2, i % 2])
+    ax.set_title(f"inner{i}", fontsize=8)
+    ax.plot(np.arange(5) * (i + 1))
+fig.savefig("50_nested_gridspec.png")
+```
+実行結果: 左側に幅1の単独 Axes("left (single)")、右側(幅2のマス)の中がさらに2x2に分割され、"inner0"〜"inner3" の4つの小さな Axes が入れ子状に配置された図が生成される。
+
+**注意点・落とし穴**:
+- 現在は `GridSpecFromSubplotSpec(nrows, ncols, subplot_spec=gs[0, 1])` の代わりに `gs[0, 1].subgridspec(2, 2)` という `SubplotSpec.subgridspec(self, nrows, ncols, **kwargs)` メソッドを使う書き方も可能で、`fig.add_subplot` に渡す前に `GridSpecFromSubplotSpec` を明示的にインポート・生成する必要がない分、より簡潔。
+
+---
+
+### アニメーション
+
+#### `matplotlib.animation.FuncAnimation(...)`
+
+**用途**: 指定したコールバック関数を繰り返し呼び出し、フレームごとにArtist(線・マーカーなど)を更新してアニメーションを作る。
+
+**シグネチャ**: `FuncAnimation(self, fig, func, frames=None, init_func=None, fargs=None, save_count=None, *, cache_frame_data=True, **kwargs)`
+
+**使用例**:
+```python
+import matplotlib.animation as animation
+import numpy as np
+
+fig, ax = plt.subplots()
+x = np.linspace(0, 2 * np.pi, 100)
+line, = ax.plot(x, np.sin(x))
+ax.set_ylim(-1.2, 1.2)
+
+def update(frame):
+    line.set_ydata(np.sin(x + frame * 0.1))
+    return (line,)
+
+ani = animation.FuncAnimation(fig, update, frames=20, interval=50, blit=True)
+print(type(ani))
+```
+実行結果:
+```
+<class 'matplotlib.animation.FuncAnimation'>
+```
+`FuncAnimation` のコンストラクタ自体はまだ描画を行わず、`ani` オブジェクトを組み立てるだけ(実際にフレームを進めるのは後述の `save` や `plt.show()` 時)であることを実機で確認した。
+
+**注意点・落とし穴**:
+- `update` 関数は「更新した(または全ての)Artist」をタプル/リストで返す必要がある(`blit=True` の場合は特に、再描画すべき範囲を matplotlib が特定するために使われる)。
+- `frames` に整数を渡すとその回数だけ `update(0), update(1), ..., update(frames-1)` の順に呼ばれる。イテラブル(配列など)を渡すと、その要素が順に `frame` 引数として渡される。
+
+---
+
+#### `ani.save(...)`
+
+**用途**: `FuncAnimation` を GIF・MP4 などのファイルとして書き出す。
+
+**シグネチャ**: `Animation.save(self, filename, writer=None, fps=None, dpi=None, codec=None, bitrate=None, extra_args=None, metadata=None, extra_anim=None, savefig_kwargs=None, *, progress_callback=None)`
+
+**使用例**:
+```python
+ani.save("51_funcanimation.gif", writer=animation.PillowWriter(fps=10))
+```
+実行結果: 20フレーム、640x480ピクセルの GIF ファイルが生成されたことを `PIL.Image.open(...).n_frames` で確認した(sin波の位相が少しずつずれていくアニメーションになっている)。
+
+**注意点・落とし穴**:
+- GIF書き出しには `Pillow` ライブラリベースの `animation.PillowWriter(self, fps=5, metadata=None, codec=None, bitrate=None)` が使える。MP4など他形式には `ffmpeg` 等の外部コマンドが別途インストールされている必要があり、未インストールだと `save()` の時点で `RuntimeError` になる。
+- `writer` を省略すると `rcParams['animation.writer']` の既定値が使われるが、それも未インストールならエラーになるため、環境によっては明示的に `writer=` を指定する方が安全。
+
+---
+
+### カスタムカラーマップ作成
+
+#### `matplotlib.colors.LinearSegmentedColormap.from_list(...)`
+
+**用途**: 任意の色のリストから、それらの間を滑らかに補間する連続カラーマップを作成する。
+
+**シグネチャ**: `LinearSegmentedColormap.from_list(name, colors, N=256, gamma=1.0, *, bad=None, under=None, over=None)`
+
+**使用例**:
+```python
+from matplotlib.colors import LinearSegmentedColormap
+import numpy as np
+
+cmap1 = LinearSegmentedColormap.from_list("navy_to_gold", ["navy", "white", "gold"], N=256)
+rng = np.random.default_rng(0)
+data = rng.random((10, 10))
+fig, ax = plt.subplots()
+im = ax.imshow(data, cmap=cmap1)
+fig.colorbar(im, ax=ax)
+fig.savefig("52_custom_cmap.png")
+print(cmap1(0.0), cmap1(0.5), cmap1(1.0))
+```
+実行結果:
+```
+(0.0, 0.0, 0.5019607843137255, 1.0) (1.0, 0.9993848519800077, 0.996078431372549, 1.0) (1.0, 0.8431372549019608, 0.0, 1.0)
+```
+`colors=["navy", "white", "gold"]` の3色を指定すると、`cmap1(0.0)` がnavyのRGBA、`cmap1(1.0)` がgoldのRGBAとほぼ一致し、`cmap1(0.5)` がほぼ白(中間色)になることを実機で確認した。生成される画像はnavy(濃紺)→白→gold(黄金)へ滑らかに変化するヒートマップになる。
+
+**注意点・落とし穴**:
+- `colors` に渡す色の数が3個以上でも、各色は等間隔に配置される(`[(位置, 色), ...]` のタプルのリストを渡せば不等間隔にもできる)。
+
+---
+
+#### `matplotlib.colors.ListedColormap(...)`
+
+**用途**: 補間せず、指定した色を離散的なカテゴリカラーマップとしてそのまま使う。
+
+**シグネチャ**: `ListedColormap(self, colors, name='unnamed', N=<deprecated parameter>, *, bad=None, under=None, over=None)`
+
+**使用例**:
+```python
+from matplotlib.colors import ListedColormap
+
+cmap2 = ListedColormap(["#440154", "#31688e", "#35b779", "#fde725"])
+fig, ax = plt.subplots()
+im = ax.imshow(data, cmap=cmap2)
+fig.colorbar(im, ax=ax)
+fig.savefig("52b_listedcolormap.png")
+```
+実行結果: 4色(紫・青緑・緑・黄色)のみで構成された、`LinearSegmentedColormap` のような滑らかなグラデーションではなくはっきりした境界を持つ4段階のヒートマップが生成される。
+
+**注意点・落とし穴**:
+- `N`(色数)引数は非推奨化されており(実機で `ListedColormap.__init__` のシグネチャに `N=<deprecated parameter>` と表示されることを確認)、色数は `colors` リストの長さでそのまま決まる。
+
+---
+
+#### `matplotlib.colors.BoundaryNorm(...)`
+
+**用途**: 連続値を指定した境界(`boundaries`)ごとの離散的な区間に分け、`ListedColormap` などの離散カラーマップと組み合わせて「等高線的な」色分けをする正規化。
+
+**シグネチャ**: `BoundaryNorm(self, boundaries, ncolors, clip=False, *, extend='neither')`
+
+**使用例**:
+```python
+from matplotlib.colors import BoundaryNorm
+import numpy as np
+
+fig, ax = plt.subplots()
+x = np.linspace(-3, 3, 50)
+y = np.linspace(-3, 3, 50)
+X, Y = np.meshgrid(x, y)
+Z = np.sin(X) * np.cos(Y)
+
+bounds = [-1, -0.5, 0, 0.5, 1]
+norm = BoundaryNorm(bounds, ncolors=256)
+pcm = ax.pcolormesh(X, Y, Z, cmap="RdBu", norm=norm, shading="auto")
+fig.colorbar(pcm, ax=ax, ticks=bounds)
+fig.savefig("53_boundarynorm.png")
+print(norm(0.3), norm(-0.8))
+```
+実行結果:
+```
+170 0
+```
+`Z` の値が `[0, 0.5)` の区間に入る `0.3` は正規化後の内部インデックスが `170`、`[-1, -0.5)` の区間に入る `-0.8` は `0`(最小)になり、連続的なsin×cosの模様が4色のくっきりした等高線状の領域に色分けされた図が生成される。
+
+**注意点・落とし穴**:
+- `Normalize` が値を `[0, 1]` に連続的にマッピングするのに対し、`BoundaryNorm` は `boundaries` で区切られた各区間に同じ色を割り当てる、階段関数的な正規化である点が根本的に異なる。
+
+---
+
+### パスエフェクト
+
+#### `artist.set_path_effects([patheffects.withStroke(...)])`
+
+**用途**: 線・テキストなどのArtistの描画パスに「縁取り(ストローク)」などの視覚効果を追加する。背景と重なっても読みやすいテキストや、線を強調したい場合によく使う。
+
+**シグネチャ**: `matplotlib.patheffects.withStroke(self, offset=(0, 0), **kwargs)`(内部的には `Stroke` + `Normal` の組み合わせのショートカット)
+
+**使用例**:
+```python
+import matplotlib.patheffects as patheffects
+import numpy as np
+
+fig, ax = plt.subplots()
+x = np.linspace(0, 10, 100)
+line, = ax.plot(x, np.sin(x), color="white", linewidth=3)
+line.set_path_effects([
+    patheffects.Stroke(linewidth=6, foreground="black"),
+    patheffects.Normal(),
+])
+txt = ax.text(5, 0, "outlined text", fontsize=20, color="yellow", ha="center")
+txt.set_path_effects([patheffects.withStroke(linewidth=3, foreground="black")])
+fig.savefig("54_patheffects.png")
+```
+実行結果: sin波の白い線が黒い太めの縁取り付きで(`Stroke`+`Normal`)輪郭のはっきりした線として表示され、中央の黄色いテキスト "outlined text" にも黒い縁取り(`withStroke`)が付いて、白背景でも読みやすくなっている図が生成される。
+
+**注意点・落とし穴**:
+- `patheffects.Stroke(...)` 単体を `set_path_effects` に渡すと縁取りだけになり元の塗り(`Normal`)が描かれないため、通常は `[Stroke(...), Normal()]` のように両方を渡す必要がある。`withStroke(...)` はこの組み合わせを1つにまとめた便利関数。
+
+---
+
+#### `matplotlib.patheffects.SimplePatchShadow(...)`
+
+**用途**: `Rectangle`/`Circle`/`Patch` 系のArtist(棒グラフの棒など)に、オフセットした半透明の影を付ける。
+
+**シグネチャ**: `SimplePatchShadow(self, offset=(2, -2), shadow_rgbFace=None, alpha=None, rho=0.3, **kwargs)`
+
+**使用例**:
+```python
+import matplotlib.patheffects as patheffects
+
+fig, ax = plt.subplots()
+bars = ax.bar(["A", "B", "C"], [3, 7, 5], color="steelblue")
+for b in bars:
+    b.set_path_effects([
+        patheffects.SimplePatchShadow(offset=(3, -3), shadow_rgbFace="gray", alpha=0.5),
+        patheffects.Normal(),
+    ])
+fig.savefig("55_patchshadow.png")
+```
+実行結果: 棒グラフの各棒の右下にオフセット `(3, -3)` の薄い灰色の影が付き、わずかに立体感のある見た目になった図が生成される(影は控えめで、拡大しないと分かりにくい程度)。
+
+**注意点・落とし穴**:
+- `patheffects.Stroke`/`withStroke` のときと同様、影だけでなく元の見た目も残したい場合は `Normal()` を必ずリストの最後に加える必要がある。
+
+---
+
+### イベント処理
+
+#### `fig.canvas.mpl_connect(...)` / `fig.canvas.mpl_disconnect(...)`
+
+**用途**: マウスクリック・キー入力などのGUIイベントにコールバック関数を紐付ける(インタラクティブな図を作る)。`mpl_disconnect` はその接続を解除する。
+
+**シグネチャ**: `FigureCanvasBase.mpl_connect(self, s, func) -> int`(戻り値の接続ID)/ `FigureCanvasBase.mpl_disconnect(self, cid)`
+
+**使用例**:
+```python
+from matplotlib.backend_bases import MouseEvent
+
+fig, ax = plt.subplots()
+ax.plot([1, 2, 3], [1, 4, 9])
+clicked = []
+
+def on_click(event):
+    clicked.append((event.button, event.xdata, event.ydata))
+    print(f"clicked: button={event.button}, xdata={event.xdata}, ydata={event.ydata}")
+
+cid = fig.canvas.mpl_connect("button_press_event", on_click)
+print("cid:", cid)
+
+# Aggバックエンドには実際のマウス入力が無いため、MouseEventを手動生成して
+# callbacks.process 経由でハンドラの動作を検証する
+ev = MouseEvent("button_press_event", fig.canvas, x=200, y=150, button=1)
+fig.canvas.callbacks.process("button_press_event", ev)
+
+fig.canvas.mpl_disconnect(cid)
+ev2 = MouseEvent("button_press_event", fig.canvas, x=100, y=100, button=1)
+fig.canvas.callbacks.process("button_press_event", ev2)
+print("clicked list length after disconnect:", len(clicked))
+```
+実行結果:
+```
+cid: 12
+clicked: button=1, xdata=0.24193548387096772, ydata=0.262987012987013
+clicked list length after disconnect: 1
+```
+`mpl_connect` で登録したハンドラは接続中(1回目のイベント)には呼ばれて `clicked` に追加され、`mpl_disconnect(cid)` で切断した後(2回目のイベント)は呼ばれず `clicked` の長さが `1` のままであることを実機で確認した。
+
+**注意点・落とし穴**:
+- `Agg` のような非対話バックエンドでは実際のマウス・キーボード入力は発生しない。動作確認には上記のように `MouseEvent`/`KeyEvent` を自分で組み立てて `canvas.callbacks.process(...)` に渡すか、`TkAgg` などGUIバックエンドで実際にウィンドウを開く必要がある。
+- `mpl_connect` の第1引数(イベント名文字列)は `'button_press_event'`, `'key_press_event'`, `'motion_notify_event'`, `'pick_event'` など決まった文字列のみ有効で、スペルミスしても例外にはならず単に呼ばれないままになる点に注意。
+
+---
+
+### Patches・Collections
+
+#### `matplotlib.patches.Circle(...)` / `Rectangle(...)` / `Polygon(...)`
+
+**用途**: 円・矩形・多角形などの図形(Patch)を直接データ座標上に描く。`plot`/`scatter` では表現しにくい任意形状の図形描画に使う。
+
+**シグネチャ**:
+- `Circle(self, xy, radius=5, **kwargs)`
+- `Rectangle(self, xy, width, height, *, angle=0.0, rotation_point='xy', **kwargs)`
+- `Polygon(self, xy, *, closed=True, **kwargs)`
+- 描画には `Axes.add_patch(self, p)` で Axes に追加する必要がある。
+
+**使用例**:
+```python
+import matplotlib.patches as mpatches
+
+fig, ax = plt.subplots(figsize=(5, 5))
+circle = mpatches.Circle((0.3, 0.3), radius=0.15, facecolor="tab:blue", alpha=0.6)
+rect = mpatches.Rectangle((0.5, 0.5), width=0.3, height=0.2, angle=15, facecolor="tab:orange")
+poly = mpatches.Polygon([[0.1, 0.7], [0.3, 0.9], [0.1, 0.9]], closed=True, facecolor="tab:green")
+ax.add_patch(circle)
+ax.add_patch(rect)
+ax.add_patch(poly)
+ax.set_xlim(0, 1)
+ax.set_ylim(0, 1)
+ax.set_aspect("equal")
+fig.savefig("56_patches.png")
+```
+実行結果: 左下寄りに半透明の青い円、中央右寄りに15度傾いたオレンジの矩形、左上に緑の三角形(3点のPolygon)が配置された図が生成される。
+
+**注意点・落とし穴**:
+- `Patch` オブジェクトを作っただけでは何も描画されない。必ず `ax.add_patch(...)` を呼んで初めて図に反映される(`ax.plot`/`ax.scatter` と違い、生成と描画登録が2段階に分かれている)。
+- `Rectangle` の `xy` は既定で左下角の座標(`rotation_point='xy'` の場合、回転もその角を中心に行われる)。中心を基準に回転したい場合は `rotation_point='center'` を指定する必要がある。
+
+---
+
+#### `matplotlib.collections.PatchCollection(...)`
+
+**用途**: 大量の `Patch`(円・矩形など)を1つの `Collection` としてまとめて扱い、共通のカラーマップで色分けする。個々に `add_patch` するより効率的で、`colorbar` にもそのまま渡せる。
+
+**シグネチャ**: `PatchCollection(self, patches, *, match_original=False, **kwargs)`
+
+**使用例**:
+```python
+import matplotlib.patches as mpatches
+from matplotlib.collections import PatchCollection
+import numpy as np
+
+fig, ax = plt.subplots(figsize=(5, 5))
+rng = np.random.default_rng(0)
+patches = [mpatches.Circle(rng.random(2), rng.random() * 0.05 + 0.02) for _ in range(30)]
+colors = rng.random(30)
+
+pc = PatchCollection(patches, cmap="viridis", alpha=0.7)
+pc.set_array(colors)
+ax.add_collection(pc)
+fig.colorbar(pc, ax=ax)
+ax.set_xlim(0, 1)
+ax.set_ylim(0, 1)
+ax.set_aspect("equal")
+fig.savefig("57_patchcollection.png")
+```
+実行結果: ランダムな位置・大きさの円が30個散らばり、`set_array(colors)` で渡した値に応じてviridisカラーマップ(紫〜黄)で色分けされた図が、右のカラーバー付きで生成される。
+
+**注意点・落とし穴**:
+- 既定 `match_original=False` では、個々の `Patch` 作成時に指定した `facecolor` などは無視され、`cmap`/`set_array` で指定した色に一律上書きされる。元の各Patchの色をそのまま活かしたい場合は `match_original=True` を指定する。
+
+---
+
+#### `matplotlib.collections.LineCollection(...)`
+
+**用途**: 大量の線分(セグメント)をまとめて1つの Collection として描画する。1本の線を区間ごとに色分けしたい場合(例: x座標に応じてグラデーション)によく使われる。
+
+**シグネチャ**: `LineCollection(self, segments, *, zorder=2, **kwargs)`
+
+**使用例**:
+```python
+from matplotlib.collections import LineCollection
+import numpy as np
+
+fig, ax = plt.subplots()
+x = np.linspace(0, 10, 200)
+y = np.sin(x)
+points = np.array([x, y]).T.reshape(-1, 1, 2)
+segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+lc = LineCollection(segments, cmap="plasma")
+lc.set_array(x)
+lc.set_linewidth(3)
+line = ax.add_collection(lc)
+ax.set_xlim(x.min(), x.max())
+ax.set_ylim(y.min() - 0.1, y.max() + 0.1)
+fig.colorbar(line, ax=ax, label="x")
+fig.savefig("58_linecollection.png")
+```
+実行結果: 1本のsin波の線が、x座標(0〜10)に応じてplasmaカラーマップ(紺→紫→オレンジ→黄)で滑らかにグラデーションした線として描かれ、右にカラーバーが付いた図が生成される。
+
+**注意点・落とし穴**:
+- `segments` は `(N, 2, 2)` 形状の配列(各行が `[[x0, y0], [x1, y1]]` の線分)である必要があり、`ax.plot` のような単純な `(x, y)` 配列とは形状が異なる。上記の `points[:-1]`/`points[1:]` を `concatenate` するイディオムが定番の作り方。
+- `Axes.set_xlim`/`set_ylim` を明示的に呼ぶ必要がある(`Collection` は `plot` と違い、追加しただけでは自動的にAxesの表示範囲がデータに合わせて広がらない場合がある)。
+
+---
+
+### カスタム目盛りフォーマッタ
+
+#### `matplotlib.ticker.PercentFormatter(...)`
+
+**用途**: 目盛りラベルの数値を「◯◯%」形式に変換する。ヒストグラムの縦軸を割合表示にする場合などに便利。
+
+**シグネチャ**: `PercentFormatter(self, xmax=100, decimals=None, symbol='%', is_latex=False)`
+
+**使用例**:
+```python
+import matplotlib.ticker as mticker
+import numpy as np
+
+fig, ax = plt.subplots()
+rng = np.random.default_rng(0)
+data = rng.normal(size=1000)
+ax.hist(data, bins=30, weights=np.ones(1000) / 1000)
+ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+fig.savefig("59_percentformatter.png")
+```
+実行結果: `weights` で各データ点の重みを `1/1000` にして度数の合計を1にした上で `PercentFormatter(xmax=1.0)` を適用すると、y軸の目盛りラベルが "0.0%", "2.0%", "4.0%", ... のようにパーセント表示に変換されたヒストグラムが生成される。
+
+**注意点・落とし穴**:
+- `xmax` は「100%に対応するデータ上の値」を指定する引数。データが既に0〜1の比率であれば `xmax=1.0`、0〜100の値であれば `xmax=100`(既定)にする必要があり、実際のデータのスケールと合わせないとパーセント表示がずれる。
+
+---
+
+#### `matplotlib.ticker.LogLocator(...)`
+
+**用途**: 対数軸上での目盛り位置を、各桁(decade)ごとに指定した倍数(`subs`)の位置に配置する。
+
+**シグネチャ**: `LogLocator(self, base=10.0, subs=(1.0,), *, numticks=None)`
+
+**使用例**:
+```python
+import matplotlib.ticker as mticker
+import numpy as np
+
+fig, ax = plt.subplots()
+x = np.linspace(1, 1000, 100)
+ax.plot(x, x**1.5)
+ax.set_yscale("log")
+ax.yaxis.set_major_locator(mticker.LogLocator(base=10.0, subs=(1.0, 2.0, 5.0)))
+fig.savefig("60_loglocator.png")
+```
+実行結果: y軸が対数スケールになり、`10^0`〜`10^4` の主要な桁のラベルが表示された図が生成される(`subs=(1.0, 2.0, 5.0)` により各桁の1倍・2倍・5倍の位置にも目盛りが追加されるが、既定のフォーマッタでは桁の代表値以外はラベルテキストが省略される)。
+
+**注意点・落とし穴**:
+- `subs=(1.0,)`(既定)では各桁の先頭(1, 10, 100, ...)にしか目盛りが立たない。桁内の目盛りを増やしたい場合は `subs=(1.0, 2.0, 5.0)` のように倍数を追加するが、ラベル文字列まで表示したい場合は別途 `LogFormatter(labelOnlyBase=False)` のようなフォーマッタも組み合わせる必要がある。
+
+---
+
+#### `matplotlib.ticker.MaxNLocator(...)`
+
+**用途**: 目盛りの本数を上限 `nbins` 以下に自動で間引きながら、なるべくキリの良い値に配置する汎用ロケータ(既定のロケータでもある)。
+
+**シグネチャ**: `MaxNLocator(self, nbins=None, **kwargs)`(`steps`, `integer`, `prune` など多数のキーワードを `**kwargs` で受け取る)
+
+**使用例**:
+```python
+import matplotlib.ticker as mticker
+import numpy as np
+
+fig, axes = plt.subplots(1, 2, figsize=(8, 3))
+x = np.linspace(0, 100, 50)
+axes[0].plot(x, x)
+axes[0].set_title("default ticks")
+axes[1].plot(x, x)
+axes[1].xaxis.set_major_locator(mticker.MaxNLocator(nbins=4, integer=True))
+axes[1].set_title("MaxNLocator(nbins=4)")
+fig.savefig("61_maxnlocator.png")
+```
+実行結果: 左のデフォルト設定では x軸目盛りが `0, 20, 40, 60, 80, 100` の6本になるのに対し、右の `MaxNLocator(nbins=4)` を適用した Axes では `0, 30, 60, 90` の4本に間引かれることを実機で確認した。
+
+**注意点・落とし穴**:
+- `nbins` は「最大でこの本数以下」という目安であり、必ずしもちょうど `nbins` 本になるわけではない(キリの良い値を優先するため、実際の本数は前後する)。
+
+---
+
+### 座標変換
+
+#### `ax.transData` / `ax.transAxes` / `fig.transFigure`
+
+**用途**: `ax.text(...)` などの `transform=` 引数に渡すことで、座標の解釈系を切り替える。`transData` はデータ座標(既定)、`transAxes` はそのAxes内の相対座標(左下(0,0)〜右上(1,1))、`transFigure` はFigure全体の相対座標。
+
+**使用例**:
+```python
+import numpy as np
+
+fig, ax = plt.subplots()
+ax.plot(np.arange(10), np.arange(10) ** 2)
+
+ax.text(5, 25, "data coords (5, 25)", transform=ax.transData, color="blue")
+ax.text(0.5, 0.9, "axes coords (0.5, 0.9)", transform=ax.transAxes, color="red", ha="center")
+fig.text(0.5, 0.02, "figure coords (0.5, 0.02)", transform=fig.transFigure, color="green", ha="center")
+
+fig.savefig("62_transforms.png")
+```
+実行結果: 青い文字("data coords (5, 25)")はデータ座標 (5, 25) の位置に、赤い文字("axes coords (0.5, 0.9)")はAxes内の横中央・上寄り(相対座標のためデータ範囲に関わらず一定の位置)に、緑の文字("figure coords (0.5, 0.02)")はFigure全体の下端中央に、それぞれ意図通りの位置に配置されることを確認した。
+
+**注意点・落とし穴**:
+- `transform` を省略すると `ax.text`/`ax.plot` などは既定で `ax.transData` が使われる。`fig.text(...)` の既定は `fig.transFigure` であり、`ax.text` と `fig.text` で既定の座標系が異なる点に注意。
+
+---
+
+#### `matplotlib.transforms.blended_transform_factory(...)`
+
+**用途**: x方向とy方向で異なる2つの `transform` を組み合わせ、「x軸はデータ座標、y軸はAxes相対座標」のような混合座標系を作る。しきい値ラインのラベルをAxesの上端付近に固定表示したい場合などに便利。
+
+**シグネチャ**: `blended_transform_factory(x_transform, y_transform)`
+
+**使用例**:
+```python
+import matplotlib.transforms as mtransforms
+import numpy as np
+
+fig, ax = plt.subplots()
+x = np.linspace(0, 10, 100)
+ax.plot(x, np.sin(x))
+
+trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+ax.axhline(0, color="gray", linestyle="--")
+ax.text(8, 0.9, "near top of axes\n(x=8 in data, y=0.9 in axes)",
+        transform=trans, color="purple", ha="center")
+fig.savefig("63_blended_transform.png")
+```
+実行結果: テキストの x座標はデータ座標の `8`(sin波の描画範囲内)、y座標はAxes相対座標の `0.9`(y軸の実際のデータ範囲である-1〜1とは無関係に、Axes全体の高さの90%の位置)に配置され、sin波の振幅(-1〜1)を超えてAxes上部に固定されることを実機で確認した。
+
+**注意点・落とし穴**:
+- `ax.axhline`/`ax.axvspan` などが内部的に使っているのもこの「片方の軸だけデータ座標、もう片方はAxes相対座標」という混合transformの考え方であり、`blended_transform_factory` を使うと同様の挙動を `text`/`plot` など任意のArtistに対しても自分で組み立てられる。

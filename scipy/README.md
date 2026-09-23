@@ -17,6 +17,13 @@ scipy 1.18.1 で検証済み(すべてのシグネチャ・出力は `/home/mana
 11. [FFT(fft)](#fftfft)
 12. [画像処理(ndimage)](#画像処理ndimage)
 13. [その他(constants・special)](#その他constantsspecial)
+14. [応用・発展](#応用発展)
+    - [高度な最適化(optimize)](#高度な最適化optimize)
+    - [高度な統計(stats)](#高度な統計stats)
+    - [高度な疎行列(sparse)](#高度な疎行列sparse)
+    - [常微分方程式の応用(integrate)](#常微分方程式の応用integrate)
+    - [信号処理の応用(signal)](#信号処理の応用signal)
+    - [特殊関数の深掘り(special)](#特殊関数の深掘りspecial)
 
 ---
 
@@ -1472,3 +1479,657 @@ print(special.erf(1.0))
 
 **注意点・落とし穴**:
 - 標準正規分布の累積分布関数と `erf` は `norm.cdf(x) = 0.5 * (1 + erf(x / sqrt(2)))` の関係で結ばれている(`scipy.stats.norm.cdf` を使えば直接計算できるため、通常は明示的に `erf` を呼ぶ場面は少ない)。
+
+---
+
+## 応用・発展
+
+### 高度な最適化(optimize)
+
+#### `scipy.optimize.differential_evolution(func, bounds, ...)`
+
+**用途**: 差分進化法による大域最適化。勾配を使わず、局所解が多い(多峰性の)関数でも大域的最小値を探索できる。
+
+**シグネチャ**: `scipy.optimize.differential_evolution(func, bounds, args=(), strategy='best1bin', maxiter=1000, popsize=15, tol=0.01, mutation=(0.5, 1), recombination=0.7, rng=None, callback=None, disp=False, polish=True, init='latinhypercube', atol=0, updating='immediate', workers=1, constraints=(), x0=None, *, integrality=None, vectorized=False, seed=None)`
+
+**使用例**:
+```python
+from scipy import optimize
+import numpy as np
+
+def rastrigin(x):
+    return 10*len(x) + sum(xi**2 - 10*np.cos(2*np.pi*xi) for xi in x)
+
+res = optimize.differential_evolution(rastrigin, bounds=[(-5.12, 5.12)]*2, seed=42)
+print(res.x, res.fun, res.success)
+```
+実行結果:
+```
+[ 1.30534318e-09 -1.03853438e-09] 0.0 True
+```
+
+**注意点・落とし穴**:
+- `minimize`(`BFGS` など)は初期値付近の局所最小値に収束するが、`differential_evolution` は `bounds` で指定した範囲全体を探索するため、Rastrigin関数のような多数の局所最小値を持つ関数でも大域最小値(この例では原点)に到達できる。
+- 母集団ベースの手法のため `minimize` より計算コストが高い。再現性が必要な場合は `seed`(または `rng`)を固定する。
+
+---
+
+#### `scipy.optimize.dual_annealing(func, bounds, ...)`
+
+**用途**: 焼きなまし法(シミュレーテッドアニーリング)ベースの大域最適化。`differential_evolution` と同様に勾配不要で多峰性関数に強い。
+
+**シグネチャ**: `scipy.optimize.dual_annealing(func, bounds, args=(), maxiter=1000, minimizer_kwargs=None, initial_temp=5230.0, restart_temp_ratio=2e-05, visit=2.62, accept=-5.0, maxfun=10000000.0, rng=None, no_local_search=False, callback=None, x0=None, *, seed=None)`
+
+**使用例**:
+```python
+from scipy import optimize
+import numpy as np
+
+def eggholder(x):
+    x0, x1 = x
+    return (-(x1 + 47) * np.sin(np.sqrt(abs(x0/2 + (x1 + 47))))
+            - x0 * np.sin(np.sqrt(abs(x0 - (x1 + 47)))))
+
+res = optimize.dual_annealing(eggholder, bounds=[(-512, 512), (-512, 512)], seed=42)
+print(res.x, res.fun)
+```
+実行結果:
+```
+[439.48113565 453.97756804] -935.3379515569777
+```
+
+**注意点・落とし穴**:
+- Eggholder関数は非常に多くの局所最小値を持つ有名なベンチマーク関数。既定では内部で局所探索(`minimize`)も併用する2段構え(dual)のアルゴリズムになっている(`no_local_search=True` で焼きなましのみに切り替え可能)。
+- `differential_evolution` と同じく大域最適化なので計算コストは通常の `minimize` より高い。
+
+---
+
+#### `scipy.optimize.nnls(A, b, ...)`
+
+**用途**: 非負制約付き最小二乗法(Non-Negative Least Squares)。`A @ x = b` を `x >= 0` の制約下で最小二乗近似する。
+
+**シグネチャ**: `scipy.optimize.nnls(A, b, *, maxiter=None)`
+
+**使用例**:
+```python
+from scipy import optimize
+import numpy as np
+
+A = np.array([[1, 0], [1, 1], [0, 1]], dtype=float)
+b = np.array([2, 1, -1], dtype=float)
+x, rnorm = optimize.nnls(A, b)
+print(x, rnorm)
+```
+実行結果:
+```
+[1.5 0. ] 1.2247448713915892
+```
+
+**注意点・落とし穴**:
+- 通常の `scipy.linalg.lstsq` では解に負の値が出うるが、`nnls` は常に `x >= 0` を満たす解を返す(この例では2つ目の成分が負になりうる制約なしの解を避け、`0` に押し込められている)。
+- 戻り値の2番目 `rnorm` は残差の2乗和の平方根(`||Ax - b||`)。
+
+---
+
+#### `scipy.optimize.minimize(fun, x0, method='trust-constr', ...)` + `scipy.optimize.NonlinearConstraint`
+
+**用途**: 非線形の等式・不等式制約付き最適化。`trust-constr` 法は信頼領域(trust-region)アルゴリズムで、非線形制約(`NonlinearConstraint`)や線形制約(`LinearConstraint`)を直接扱える。
+
+**シグネチャ**: `scipy.optimize.NonlinearConstraint(fun, lb, ub, jac='2-point', hess=None, keep_feasible=False, finite_diff_rel_step=None, finite_diff_jac_sparsity=None)`
+
+**使用例**:
+```python
+from scipy import optimize
+
+def f(x):
+    return (x[0]-1)**2 + (x[1]-2.5)**2
+
+# 制約: x0^2 + x1^2 <= 1 (単位円の内側)
+nlc = optimize.NonlinearConstraint(lambda x: x[0]**2 + x[1]**2, -1e9, 1)
+res = optimize.minimize(f, x0=[0.5, 0.5], method='trust-constr', constraints=[nlc])
+print(res.x, res.fun, res.success)
+```
+実行結果:
+```
+[0.37139054 0.92847634] 2.8648364728736206 True
+```
+
+**注意点・落とし穴**:
+- 制約なしなら最小値は `(1, 2.5)` だが、`x0^2+x1^2<=1` の制約により単位円周上の境界に解が押し出される。
+- `NonlinearConstraint` の `lb`/`ub` は下限・上限。片側のみ制約したい場合は反対側を `np.inf`/`-np.inf` にする(`method='SLSQP'` では `NonlinearConstraint` の代わりに辞書形式の `constraints` も使えるが、`trust-constr` は `NonlinearConstraint`/`LinearConstraint` オブジェクトが基本)。
+
+---
+
+#### `scipy.optimize.linear_sum_assignment(cost_matrix, ...)`
+
+**用途**: 割当問題(ハンガリアン法)。コスト行列が与えられたとき、総コストが最小になるように行と列を1対1で対応付ける組み合わせを求める。
+
+**シグネチャ**: `scipy.optimize.linear_sum_assignment(cost_matrix, maximize=False)`
+
+**使用例**:
+```python
+from scipy import optimize
+import numpy as np
+
+cost = np.array([[4, 1, 3], [2, 0, 5], [3, 2, 2]])
+row_ind, col_ind = optimize.linear_sum_assignment(cost)
+print(row_ind, col_ind)
+print(cost[row_ind, col_ind].sum())
+```
+実行結果:
+```
+[0 1 2] [1 0 2]
+5
+```
+
+**注意点・落とし穴**:
+- `differential_evolution` などの連続最適化とは異なり、これは組み合わせ最適化(離散問題)専用の関数。正方行列でなくても(長方形の行列でも)動作する。
+- `maximize=True` で総コスト最大化(利益最大化の割当)にも切り替えられる。
+
+---
+
+### 高度な統計(stats)
+
+#### `scipy.stats.multivariate_normal(mean=None, cov=1, ...)`
+
+**用途**: 多変量正規分布。共分散行列を指定して同時確率密度の評価や乱数生成を行う。
+
+**シグネチャ**: `scipy.stats.multivariate_normal(mean=None, cov=1, allow_singular=False, seed=None, **kwds)`(呼び出すと凍結(frozen)分布インスタンスが得られる)
+
+**使用例**:
+```python
+from scipy import stats
+
+mvn = stats.multivariate_normal(mean=[0, 0], cov=[[1, 0.5], [0.5, 2]])
+print(mvn.pdf([0, 0]))
+print(mvn.rvs(size=3, random_state=42))
+```
+実行結果:
+```
+0.12030982838508356
+[[ 0.16865045  0.72887797]
+ [ 1.62117105  0.36999679]
+ [-0.32573873 -0.24160214]]
+```
+
+**注意点・落とし穴**:
+- `cov` は分散共分散行列(対称行列)。非対角成分は変数間の共分散を表し、この例のように正の値だと2変数は正の相関を持つ乱数になる。
+- `cov` が特異(ランク落ち)な場合は既定でエラーになる。特異行列でも扱いたい場合は `allow_singular=True` を指定する。
+
+---
+
+#### `scipy.stats.bootstrap(data, statistic, ...)`
+
+**用途**: ブートストラップ法(リサンプリング)により、統計量(平均・中央値など任意の関数)の信頼区間を推定する。
+
+**シグネチャ**: `scipy.stats.bootstrap(data, statistic, *, n_resamples=9999, batch=None, vectorized=None, paired=False, axis=0, confidence_level=0.95, alternative='two-sided', method='BCa', bootstrap_result=None, rng=None, random_state=None)`
+
+**使用例**:
+```python
+from scipy import stats
+import numpy as np
+
+rng = np.random.default_rng(0)
+data = (rng.normal(loc=5, scale=2, size=50),)
+res = stats.bootstrap(data, np.mean, confidence_level=0.95, n_resamples=2000, rng=42)
+print(res.confidence_interval)
+```
+実行結果:
+```
+ConfidenceInterval(low=np.float64(4.752494918934924), high=np.float64(5.748710031554587))
+```
+
+**注意点・落とし穴**:
+- `data` はタプルで渡す(単一標本でも `(sample,)` のように1要素タプルにする必要がある)。
+- 既定 `method='BCa'`(bias-corrected and accelerated)は分布の歪みを補正した信頼区間を計算する。正規分布を仮定しないため、理論分布が分からない統計量(中央値・分散など)にも使える。
+- 乱数の再現性は `rng`(新しい `Generator` ベースAPI)または `random_state`(レガシー)で制御する。
+
+---
+
+#### `scipy.stats.permutation_test(data, statistic, ...)`
+
+**用途**: 順列検定(ランダマイゼーション検定)。標本をランダムに入れ替えて検定統計量の帰無分布を経験的に構築し、p値を求める(分布を仮定しないノンパラメトリック検定)。
+
+**シグネチャ**: `scipy.stats.permutation_test(data, statistic, *, permutation_type='independent', vectorized=None, n_resamples=9999, batch=None, alternative='two-sided', axis=0, rng=None, random_state=None)`
+
+**使用例**:
+```python
+from scipy import stats
+import numpy as np
+
+x = [23, 21, 18, 30, 25, 27, 22]
+y = [31, 28, 35, 29, 33, 30, 32]
+
+def statistic(x, y):
+    return np.mean(x) - np.mean(y)
+
+res = stats.permutation_test((x, y), statistic, n_resamples=9999, rng=42)
+print(res.statistic, res.pvalue)
+```
+実行結果:
+```
+-7.428571428571427 0.002913752913752914
+```
+
+**注意点・落とし穴**:
+- `ttest_ind` は正規分布を仮定するが、`permutation_test` は「群のラベルを入れ替えても統計量の分布が変わらない」という帰無仮説のみを仮定するため、より仮定が緩い。標本数が少なく分布が疑わしい場合の代替になる。
+- `n_resamples` が実際の順列総数より多い場合は、可能な組み合わせを網羅する厳密検定(exact test)に自動的に切り替わることがある。
+
+---
+
+#### `scipy.stats.ecdf(sample)`
+
+**用途**: 経験累積分布関数(Empirical CDF)を計算する。ヒストグラムのようにビン幅を決める必要がなく、観測データそのものから分布を推定できる。
+
+**シグネチャ**: `scipy.stats.ecdf(sample: 'npt.ArrayLike | CensoredData') -> scipy.stats._survival.ECDFResult`
+
+**使用例**:
+```python
+from scipy import stats
+
+sample = [2, 4, 4, 5, 7, 8, 8, 8, 10]
+res = stats.ecdf(sample)
+print(res.cdf.quantiles)
+print(res.cdf.probabilities)
+```
+実行結果:
+```
+[ 2.  4.  5.  7.  8. 10.]
+[0.11111111 0.33333333 0.44444444 0.55555556 0.88888889 1.        ]
+```
+
+**注意点・落とし穴**:
+- `quantiles` はデータ中のユニークな値(この例では重複する `4` と `8` はそれぞれ1つにまとめられる)。`probabilities` は各値「以下」の累積相対度数。
+- `stats.kstest` の内部でも同種の経験分布の考え方が使われている。打ち切りデータ(`CensoredData`)にも対応している点が `numpy` で自前計算するより優れる。
+
+---
+
+### 高度な疎行列(sparse)
+
+#### `scipy.sparse.linalg.eigsh(A, k=6, ...)`
+
+**用途**: 対称(またはエルミート)な疎行列の固有値・固有ベクトルを、指定した個数 `k` だけ計算する(ARPACK使用。行列全体を密行列化せずに上位/下位の固有値だけ求められる)。
+
+**シグネチャ**: `scipy.sparse.linalg.eigsh(A, k=6, M=None, sigma=None, which='LM', v0=None, ncv=None, maxiter=None, tol=0, return_eigenvectors=True, Minv=None, OPinv=None, mode='normal', rng=None)`
+
+**使用例**:
+```python
+from scipy import sparse
+from scipy.sparse import linalg as sla
+import numpy as np
+
+rng = np.random.default_rng(0)
+A_dense = rng.normal(size=(50, 50))
+A_sym = A_dense + A_dense.T
+A = sparse.csr_matrix(A_sym)
+vals, vecs = sla.eigsh(A, k=3, which='LA')
+print(vals)
+```
+実行結果:
+```
+[16.0478559  17.41751611 19.32228514]
+```
+
+**注意点・落とし穴**:
+- `scipy.linalg.eigh`(密行列版)は全固有値を計算するが、`eigsh` は `k` 個だけを反復法で近似的に求める。大規模疎行列で上位数個の固有値だけが欲しい場合に有効(`k` は行列サイズ未満である必要がある)。
+- `which='LA'` は最大の代数的固有値(Largest Algebraic)。絶対値最大なら `'LM'`(既定)、最小なら `'SA'`/`'SM'` を指定する。
+
+---
+
+#### `scipy.sparse.linalg.splu(A, ...)`
+
+**用途**: 疎行列のLU分解(SuperLU使用)。同じ行列 `A` で右辺 `b` を変えながら何度も `A @ x = b` を解く場合、分解結果を再利用して高速化できる。
+
+**シグネチャ**: `scipy.sparse.linalg.splu(A, permc_spec=None, diag_pivot_thresh=None, relax=None, panel_size=None, options=None)`
+
+**使用例**:
+```python
+from scipy import sparse
+from scipy.sparse import linalg as sla
+import numpy as np
+
+A = sparse.csc_matrix(np.array([[4., 1., 0.], [1., 3., 1.], [0., 1., 2.]]))
+lu = sla.splu(A)
+b = np.array([1., 2., 3.])
+print(lu.solve(b))
+```
+実行結果:
+```
+[0.22222222 0.11111111 1.44444444]
+```
+
+**注意点・落とし穴**:
+- `spsolve` は毎回分解からやり直すが、`splu` は分解結果(`lu` オブジェクト)を保持できるので、右辺 `b` だけを変えて何度も解く用途では `splu(A).solve(b)` を使い回す方が効率的。
+- 入力は CSC形式が推奨される(内部でCSCに変換されるため、事前にCSCで渡すと変換コストを省ける)。
+
+---
+
+#### 疎行列フォーマット変換(`tocsr` / `tocsc` / `scipy.sparse.issparse`)
+
+**用途**: 疎行列は用途によって最適な格納形式が異なる(COO=構築向き、CSR=行方向演算向き、CSC=列方向演算向き)。`.tocsr()` / `.tocsc()` などで相互変換し、`scipy.sparse.issparse` で疎行列かどうかを判定する。
+
+**シグネチャ**: `scipy.sparse.issparse(x)`(各疎行列クラスの `.tocsr(copy=False)` / `.tocsc(copy=False)` などは引数がほぼ共通)
+
+**使用例**:
+```python
+from scipy import sparse
+import numpy as np
+
+dense = np.array([[0, 0, 3], [4, 0, 0], [0, 5, 0]])
+coo = sparse.coo_matrix(dense)
+print(type(coo).__name__)
+print(type(coo.tocsr()).__name__)
+print(type(coo.tocsc()).__name__)
+print(sparse.issparse(coo), sparse.issparse(dense))
+```
+実行結果:
+```
+coo_matrix
+csr_matrix
+csc_matrix
+True False
+```
+
+**注意点・落とし穴**:
+- `issparse` は通常の `numpy.ndarray` には `False` を返す(疎行列かどうかの判定に `isinstance` を直接使うより将来のクラス変更に頑健)。
+- COO形式は要素の追加・構築が速いが演算には不向き。行スライス/行列積主体なら `tocsr()`、列スライス/列演算主体なら `tocsc()` に変換してから使うのが定石(`sparse.csr_matrix(dense)` のように最初から目的の形式で作ってしまってもよい)。
+
+---
+
+#### `scipy.sparse.linalg.svds(A, k=6, ...)`
+
+**用途**: 疎行列の特異値分解(SVD)を、上位 `k` 個の特異値・特異ベクトルだけ計算する(密行列化せずに次元削減やLSAなどに使える)。
+
+**シグネチャ**: `scipy.sparse.linalg.svds(A, k=6, ncv=None, tol=0, which='LM', v0=None, maxiter=None, return_singular_vectors=True, solver='arpack', rng=None, options=None, *, random_state=None)`
+
+**使用例**:
+```python
+from scipy import sparse
+from scipy.sparse import linalg as sla
+import numpy as np
+
+rng = np.random.default_rng(0)
+M = sparse.csr_matrix(rng.normal(size=(30, 10)))
+U, s, Vt = sla.svds(M, k=3, rng=0)
+print(np.sort(s)[::-1])
+```
+実行結果:
+```
+[8.27541018 7.76557012 6.71594282]
+```
+
+**注意点・落とし穴**:
+- `scipy.linalg.svd`(密行列版)は全特異値を降順で返すが、`svds` は反復法のため `s` が昇順に近い順不同で返ることがある(この例でも降順に並べ替えるため `np.sort(...)[::-1]` を使っている)。
+- 内部で反復法の初期ベクトルに乱数を使うため、`rng`(または `v0`)を固定しないと実行毎に微妙に異なる結果になりうる(通常のNumPyのグローバルシードとは独立)。
+
+---
+
+### 常微分方程式の応用(integrate)
+
+#### `scipy.integrate.solve_ivp(..., events=...)`
+
+**用途**: `solve_ivp` の `events` 引数で「特定の条件を満たした瞬間」を検出する。イベント関数の符号が変わったタイミングを二分探索で特定し、`terminal=True` にすると積分をそこで打ち切れる(例: 物体が地面に着いた瞬間で計算を止める)。
+
+**シグネチャ**: `scipy.integrate.solve_ivp(fun, t_span, y0, method='RK45', t_eval=None, dense_output=False, events=None, vectorized=False, args=None, **options)`
+
+**使用例**:
+```python
+from scipy import integrate
+import numpy as np
+
+def falling(t, y):
+    return [y[1], -9.8]
+
+def hit_ground(t, y):
+    return y[0]
+hit_ground.terminal = True
+hit_ground.direction = -1
+
+sol = integrate.solve_ivp(falling, [0, 10], [10, 0], events=hit_ground)
+print(sol.t_events)
+print(np.round(sol.y_events[0], 4))
+print(sol.status)
+```
+実行結果:
+```
+[array([1.42857143])]
+[[ -0. -14.]]
+1
+```
+
+**注意点・落とし穴**:
+- イベント関数(この例では高さ `y[0]`)自体に `.terminal`(見つかったら積分を止めるか)、`.direction`(符号がどちら向きに変化したときだけ検出するか。負なら減少方向)を属性として設定する。
+- `sol.status` は `1` が「イベントで終了」、`0` が「t_spanの終端まで到達」、`-1` が「積分失敗」を意味する。`sol.t_events`/`sol.y_events` はイベントごとのリストで、複数のイベント関数を渡した場合は要素数もそれに応じて増える。
+
+---
+
+#### `scipy.integrate.solve_bvp(fun, bc, x, y, ...)`
+
+**用途**: 常微分方程式の境界値問題(BVP)を解く。初期値問題(`solve_ivp`)と異なり、両端の境界条件(`bc`)を満たす解を反復的に探す。
+
+**シグネチャ**: `scipy.integrate.solve_bvp(fun, bc, x, y, p=None, S=None, fun_jac=None, bc_jac=None, tol=0.001, max_nodes=1000, verbose=0, bc_tol=None)`
+
+**使用例**:
+```python
+from scipy import integrate
+import numpy as np
+
+def fun(x, y):
+    return np.vstack([y[1], -np.abs(y[0])])
+
+def bc(ya, yb):
+    return np.array([ya[0], yb[0] + 2])
+
+x = np.linspace(0, 4, 5)
+y0 = np.zeros((2, x.size))
+res = integrate.solve_bvp(fun, bc, x, y0)
+print(res.status, res.success)
+print(np.round(res.sol(np.array([0, 1, 2, 3, 4]))[0], 4))
+```
+実行結果:
+```
+0 True
+[ 0.      1.7394  1.8797  0.2921 -2.    ]
+```
+
+**注意点・落とし穴**:
+- `fun(x, y)` は `y` の各成分をまとめた2次元配列(`(状態変数の数, メッシュ点数)`)を受け取り、同じ形の導関数を返す必要がある(`solve_ivp` の `fun(t, y)` とは引数の意味も形も異なる)。
+- `y` の初期推定値(この例では全て0)は解に収束するための出発点。境界条件 `bc(ya, yb)` は「左端の状態 `ya`」「右端の状態 `yb`」を受け取り、満たすべき等式が0になるように定義する(この例は `ya[0]=0`, `yb[0]=-2` という境界条件)。
+- 戻り値 `res.sol` は連続関数として解を評価できる補間オブジェクト(`dense_output` 相当)。メッシュ点 `x` 以外の任意の点でも `res.sol(x_new)` で評価できる。
+
+---
+
+### 信号処理の応用(signal)
+
+#### `scipy.signal.spectrogram(x, fs=1.0, ...)`
+
+**用途**: 信号を短時間区間ごとにフーリエ変換し、時間軸・周波数軸・パワースペクトル密度の3つ組(スペクトログラム)を返す。周波数成分が時間とともに変化する非定常信号の解析に使う。
+
+**シグネチャ**: `scipy.signal.spectrogram(x, fs=1.0, window=('tukey_periodic', 0.25), nperseg=None, noverlap=None, nfft=None, detrend='constant', return_onesided=True, scaling='density', axis=-1, mode='psd')`
+
+**使用例**:
+```python
+from scipy import signal
+import numpy as np
+
+fs = 100.0
+t = np.arange(0, 2, 1/fs)
+# 前半1秒は10Hz、後半1秒は25Hzの正弦波
+x = np.where(t < 1, np.sin(2*np.pi*10*t), np.sin(2*np.pi*25*t))
+f, tt, Sxx = signal.spectrogram(x, fs, nperseg=50)
+print(f.shape, tt.shape, Sxx.shape)
+print(np.round(f[np.argmax(Sxx, axis=0)], 1))
+```
+実行結果:
+```
+(26,) (4,) (26, 4)
+[10. 10. 24. 24.]
+```
+
+**注意点・落とし穴**:
+- `fft`(全区間を一度に変換)では「いつ」周波数が変化したかが分からないが、`spectrogram` は区間(セグメント)ごとに変換するため周波数の時間変化が追える。この例でも前半セグメントは10Hz付近、後半は25Hz付近がピークになっている。
+- `nperseg`(セグメント長)を大きくすると周波数分解能は上がるが時間分解能が下がる(トレードオフ)。`Sxx` の形状は `(周波数ビン数, 時間セグメント数)`。
+
+---
+
+#### `scipy.signal.ShortTimeFFT(win, hop, fs, ...)`
+
+**用途**: `stft`/`spectrogram` の後継となる短時間フーリエ変換(STFT)の実装。ウィンドウとホップ幅を明示的にオブジェクトとして保持し、STFT/ISTFT(逆変換)を一貫して扱える。
+
+**シグネチャ**: `scipy.signal.ShortTimeFFT(win: numpy.ndarray, hop: int, fs: float, *, fft_mode='onesided', mfft=None, dual_win=None, scale_to=None, phase_shift=0)`
+
+**使用例**:
+```python
+from scipy import signal
+import numpy as np
+
+fs = 100.0
+t = np.arange(0, 2, 1/fs)
+x = np.where(t < 1, np.sin(2*np.pi*10*t), np.sin(2*np.pi*25*t))
+
+win = signal.windows.hann(50)
+SFT = signal.ShortTimeFFT(win, hop=25, fs=fs)
+Sx = SFT.stft(x)
+print(Sx.shape)
+print(np.round(SFT.f[np.argmax(np.abs(Sx), axis=0)], 1))
+```
+実行結果:
+```
+(26, 9)
+[10. 10. 10. 10. 10. 26. 26. 24. 24.]
+```
+
+**注意点・落とし穴**:
+- 公式ドキュメントでは、レガシーな `scipy.signal.stft`/`istft` 関数より `ShortTimeFFT` クラスの使用が推奨されている(パディングの扱いなどがより明確)。
+- `win`(窓関数の配列そのもの)と `hop`(ホップ幅、サンプル数)を自分で用意する必要がある点が `spectrogram` の `nperseg`/`noverlap` 指定と異なる。窓は `scipy.signal.windows` モジュール(例: `windows.hann(N)`)から作るのが一般的。
+
+---
+
+#### `scipy.signal.hilbert(x, ...)`
+
+**用途**: ヒルベルト変換により解析信号(analytic signal)を求める。信号の瞬時振幅(エンベロープ)や瞬時位相の抽出に使う。
+
+**シグネチャ**: `scipy.signal.hilbert(x, N=None, axis=-1)`
+
+**使用例**:
+```python
+from scipy import signal
+import numpy as np
+
+t = np.linspace(0, 1, 100, endpoint=False)
+sig_in = (1 + 0.5*t) * np.sin(2*np.pi*5*t)   # 振幅が徐々に大きくなる正弦波
+analytic = signal.hilbert(sig_in)
+envelope = np.abs(analytic)
+print(np.round(envelope[::20], 4))
+```
+実行結果:
+```
+[1.25   1.1212 1.2052 1.2948 1.3788]
+```
+
+**注意点・落とし穴**:
+- `scipy.signal.hilbert` が返すのは実信号+虚部としてのヒルベルト変換を組み合わせた「解析信号」(複素数配列)であり、ヒルベルト変換そのもの(虚部だけ)ではない点に注意(名前から誤解しやすい)。
+- `np.abs(analytic)` で振幅包絡線(エンベロープ)、`np.unwrap(np.angle(analytic))` で瞬時位相が得られる。この例では元の振幅係数 `1 + 0.5*t`(0〜1の間で1.0→1.5に増加)にほぼ一致したエンベロープが復元されている。
+
+---
+
+### 特殊関数の深掘り(special)
+
+#### `scipy.special.jv(v, z)`
+
+**用途**: 第一種ベッセル関数。円筒対称な波動方程式・振動問題などに現れる特殊関数。
+
+**シグネチャ**: `scipy.special.jv(v, z, /, out=None, *, where=True, casting='same_kind', order='K', dtype=None, subok=True, signature=None)`(`inspect.signature` 上は汎用の `x1, x2` と表示されるが、実際の引数は次数 `v` と引数 `z`)
+
+**使用例**:
+```python
+from scipy import special
+
+print(special.jv(0, 1.0))
+print(special.jv(1, 1.0))
+print(special.jv([0, 1, 2], 5.0))
+```
+実行結果:
+```
+0.7651976865579666
+0.44005058574493355
+[-0.17759677 -0.32757914  0.04656512]
+```
+
+**注意点・落とし穴**:
+- 第一引数 `v`(次数)は整数だけでなく実数(分数次)も指定できる。`v` に配列を渡すと複数の次数をまとめて計算できる(ブロードキャストされる)。
+
+---
+
+#### `scipy.special.iv(v, z)` / `scipy.special.kv(v, z)`
+
+**用途**: 修正ベッセル関数(第一種 `iv`・第二種 `kv`)。熱伝導や拡散方程式など、振動しない指数関数的な解に現れる。
+
+**シグネチャ**: `scipy.special.iv(v, z, /, out=None, ...)` / `scipy.special.kv(v, z, /, out=None, ...)`(`jv` と同様、引数は次数 `v` と引数 `z`)
+
+**使用例**:
+```python
+from scipy import special
+
+print(special.iv(0, 1.0))
+print(special.kv(0, 1.0))
+```
+実行結果:
+```
+1.2660658777520084
+0.42102443824070834
+```
+
+**注意点・落とし穴**:
+- `jv`/`yv`(通常のベッセル関数)は振動しながら減衰するが、`iv` は `z` が大きくなると指数的に発散し、`kv` は指数的に減衰する。名前が似ているため混同しやすい(`i`=Increasing/`k`=Kelvin由来の慣習的な記号)。
+
+---
+
+#### `scipy.special.ellipk(m)` / `scipy.special.ellipe(m)`
+
+**用途**: 第一種・第二種の完全楕円積分。振り子の周期の厳密解や楕円の弧長計算などに使われる。
+
+**シグネチャ**: `scipy.special.ellipk(m, /, out=None, *, where=True, casting='same_kind', order='K', dtype=None, subok=True, signature=None)` / `scipy.special.ellipe(m, /, out=None, ...)`(同形)
+
+**使用例**:
+```python
+from scipy import special
+
+print(special.ellipk(0.5))
+print(special.ellipe(0.5))
+```
+実行結果:
+```
+1.8540746773013719
+1.3506438810476755
+```
+
+**注意点・落とし穴**:
+- SciPyの引数 `m` は離心率的パラメータ `m = k^2`(母数)であり、楕円の「弾性率(modulus)」 `k` そのものではない(文献によっては `K(k)` と `K(m)` の記法が混在するので要注意)。`m=1` に近づくと `ellipk` は発散する。
+
+---
+
+#### `scipy.special.logsumexp(a, ...)` / `scipy.special.softmax(x, ...)`
+
+**用途**: `logsumexp` はオーバーフローを避けながら `log(sum(exp(a)))` を数値的に安定して計算する。`softmax` は入力を確率分布(合計1の非負値)に変換する(`logsumexp` を内部で利用)。
+
+**シグネチャ**: `scipy.special.logsumexp(a, axis=None, b=None, keepdims=False, return_sign=False)` / `scipy.special.softmax(x, axis=None)`
+
+**使用例**:
+```python
+from scipy import special
+import numpy as np
+
+a = np.array([1000.0, 1000.0, 1000.0])
+print(special.logsumexp(a))          # 素朴に log(sum(exp(a))) を計算するとオーバーフローしてinfになる
+print(special.softmax([1.0, 2.0, 3.0]))
+```
+実行結果:
+```
+1001.0986122886682
+[0.09003057 0.24472847 0.66524096]
+```
+
+**注意点・落とし穴**:
+- 実際に `np.log(np.sum(np.exp(a)))` を同じ入力(`a = [1000, 1000, 1000]`)で計算すると `exp(1000)` の時点でオーバーフローし `RuntimeWarning: overflow encountered in exp` とともに `inf` が返る(実行して確認済み)。`logsumexp` は最大値を引いてから計算する数値的トリックによりこれを回避し、正しく `1001.0986...` を返す。
+- ロジスティック回帰やソフトマックス回帰、混合モデルの対数尤度計算など、指数と対数が組み合わさる箇所では素朴な実装よりこれらの関数を使う方が安全。

@@ -16,6 +16,13 @@ numpy 2.4.6 で検証済み(すべてのシグネチャ・出力は `/home/manat
 10. [論理演算・マスク処理](#論理演算マスク処理)
 11. [ファイルI/O](#ファイルio)
 12. [その他便利関数](#その他便利関数)
+13. [応用・発展](#応用発展)
+    - [構造化配列・マスク配列](#構造化配列マスク配列)
+    - [メモリマップ・ストライド・高度なブロードキャスト](#メモリマップストライド高度なブロードキャスト)
+    - [多項式フィッティング](#多項式フィッティング)
+    - [einsum応用・カスタムufunc](#einsum応用カスタムufunc)
+    - [高度な線形代数・テストユーティリティ](#高度な線形代数テストユーティリティ)
+    - [乱数の高度な使い方](#乱数の高度な使い方)
 
 ---
 
@@ -1692,3 +1699,701 @@ print(a.reshape(2, 3, order='F'))
 
 **注意点・落とし穴**:
 - 既定は `'C'`(行優先、C言語と同じ)。MATLAB や Fortran 由来のコードを移植する際は `'F'`(列優先)を意識する必要がある場合がある。
+
+---
+
+## 応用・発展
+
+### 構造化配列・マスク配列
+
+#### 構造化配列(structured array)
+
+**用途**: 異なる型のフィールド(列)を持つレコード形式のデータを1つの ndarray として扱う。
+
+**シグネチャ**: `np.dtype(dtype, align=False, copy=False, **kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+dt = np.dtype([('name', 'U10'), ('age', 'i4'), ('weight', 'f8')])
+people = np.array([('Alice', 25, 55.0), ('Bob', 30, 72.5)], dtype=dt)
+print(people)
+print(people['name'])
+print(people['age'].mean())
+print(people[0])
+```
+実行結果:
+```
+[('Alice', 25, 55. ) ('Bob', 30, 72.5)]
+['Alice' 'Bob']
+27.5
+('Alice', 25, 55.0)
+```
+
+**注意点・落とし穴**:
+- フィールドには `people['name']` のように角括弧でアクセスする(属性アクセスではない)。属性アクセスしたい場合は後述の `np.recarray` を使う。
+- `'U10'` は最大10文字の Unicode 文字列型。それより長い文字列を代入すると警告なく切り詰められる。
+
+---
+
+#### `np.recarray`
+
+**用途**: 構造化配列のフィールドに `.属性名` でアクセスできるようにしたサブクラス。
+
+**シグネチャ**: `np.recarray(shape, dtype=None, buf=None, offset=0, strides=None, formats=None, names=None, titles=None, byteorder=None, aligned=False, order='C')`
+
+**使用例**:
+```python
+import numpy as np
+dt = np.dtype([('name', 'U10'), ('age', 'i4')])
+arr = np.array([('Alice', 25), ('Bob', 30)], dtype=dt)
+rec = arr.view(np.recarray)
+print(rec.name)
+print(rec.age)
+rec.age += 1
+print(rec.age)
+```
+実行結果:
+```
+['Alice' 'Bob']
+[25 30]
+[26 31]
+```
+
+**注意点・落とし穴**:
+- 実務では `np.recarray(shape, ...)` で直接生成するより、既存の構造化配列を `.view(np.recarray)` でビュー変換して使うことが多い。ビューなので元の配列と書き込みが共有される。
+
+---
+
+#### `np.ma.masked_array(data, mask, ...)`
+
+**用途**: 欠損値・無効値をマスクした配列を扱う。マスクされた要素は集計関数から自動的に除外される。
+
+**シグネチャ**: `np.ma.masked_array(data=None, mask=np.False_, dtype=None, copy=False, subok=True, ndmin=0, fill_value=None, keep_mask=True, hard_mask=None, shrink=True, order=None)`
+
+**使用例**:
+```python
+import numpy as np
+a = np.array([1, 2, -999, 4, -999])
+m = np.ma.masked_array(a, mask=(a == -999))
+print(m)
+print(m.mean())
+print(m.filled(0))
+```
+実行結果:
+```
+[1 2 -- 4 --]
+2.3333333333333335
+[1 2 0 4 0]
+```
+
+**注意点・落とし穴**:
+- `mean()` 等の集計関数はマスクされた要素を自動的に除外して計算する(上記は `(1+2+4)/3`)。通常の `np.mean(a)` ではこの除外は行われず `-999` を含んだ値になってしまう。
+- `.filled(value)` でマスク位置を指定値に置き換えた通常の ndarray を取り出せる。
+
+---
+
+#### `np.ma.masked_where(condition, a)` / `np.ma.masked_invalid(a)`
+
+**用途**: 条件式や NaN/Inf に基づいてマスクを自動生成する。
+
+**シグネチャ**: `np.ma.masked_where(condition, a, copy=True)` / `np.ma.masked_invalid(a, copy=True)`
+
+**使用例**:
+```python
+import numpy as np
+a = np.array([1.0, -2.0, np.nan, 4.0, -5.0])
+m = np.ma.masked_where(a < 0, a)
+print(m)
+m2 = np.ma.masked_invalid(a)
+print(m2)
+print(m.sum())
+```
+実行結果:
+```
+[1.0 -- nan 4.0 --]
+[1.0 -2.0 -- 4.0 -5.0]
+nan
+```
+
+**注意点・落とし穴**:
+- `masked_where(a < 0, a)` は条件を満たす要素だけをマスクするため、`nan` 自体は自動ではマスクされない(上記で `m.sum()` が `nan` になるのはこのため)。NaN/Inf もまとめてマスクしたい場合は `masked_invalid` を使う。
+
+---
+
+### メモリマップ・ストライド・高度なブロードキャスト
+
+#### `np.memmap(filename, dtype, mode, shape, ...)`
+
+**用途**: ディスク上のバイナリファイルを全展開せず、必要な部分だけを読み書きする(メモリに乗り切らない巨大配列向け)。
+
+**シグネチャ**: `np.memmap(filename, dtype=<class 'numpy.uint8'>, mode='r+', offset=0, shape=None, order='C')`
+
+**使用例**:
+```python
+import numpy as np
+import tempfile, os
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, 'data.dat')
+    mm = np.memmap(path, dtype='float64', mode='w+', shape=(3, 3))
+    mm[:] = np.arange(9).reshape(3, 3)
+    mm.flush()
+    del mm
+
+    mm2 = np.memmap(path, dtype='float64', mode='r', shape=(3, 3))
+    print(mm2)
+    print(type(mm2))
+```
+実行結果:
+```
+[[0. 1. 2.]
+ [3. 4. 5.]
+ [6. 7. 8.]]
+<class 'numpy.memmap'>
+```
+
+**注意点・落とし穴**:
+- `mode='w+'` は新規作成(既存データは破棄)、`'r+'` は既存ファイルの読み書き、`'r'` は読み取り専用。書き込み後は `.flush()`(またはオブジェクト破棄)でディスクに反映させる必要がある。
+- ファイル自体には dtype/shape のメタ情報が保存されないため、読み込み時に自分で指定し直す必要がある(メタ情報も一緒に保存したい場合は `np.save`/`np.load` の方が適する)。
+
+---
+
+#### `ndarray.strides`
+
+**用途**: 各軸を1つ進めるときにメモリ上で何バイト移動するかを示す属性。配列のメモリレイアウトを理解する手がかりになる。
+
+**使用例**:
+```python
+import numpy as np
+a = np.arange(12, dtype=np.int64).reshape(3, 4)
+print(a.strides)
+print(a.itemsize)
+b = a.T
+print(b.strides)
+```
+実行結果:
+```
+(32, 8)
+8
+(8, 32)
+```
+
+**注意点・落とし穴**:
+- `.T` のような転置操作は実データをコピーせず、`strides` の並びを入れ替えるだけのビューを返す。そのため `b.strides` は `a.strides` の逆順になる。
+
+---
+
+#### `np.lib.stride_tricks.as_strided(x, shape, strides, ...)`
+
+**用途**: 任意の shape・strides で既存メモリバッファを「覗き見る」低レベル API。コピーなしでスライディングウィンドウなどを作れる。
+
+**シグネチャ**: `np.lib.stride_tricks.as_strided(x, shape=None, strides=None, subok=False, writeable=True)`
+
+**使用例**:
+```python
+import numpy as np
+from numpy.lib.stride_tricks import as_strided
+
+a = np.arange(10, dtype=np.int64)
+window = 3
+n = a.shape[0] - window + 1
+windows = as_strided(a, shape=(n, window), strides=(a.strides[0], a.strides[0]))
+print(windows)
+```
+実行結果:
+```
+[[0 1 2]
+ [1 2 3]
+ [2 3 4]
+ [3 4 5]
+ [4 5 6]
+ [5 6 7]
+ [6 7 8]
+ [7 8 9]]
+```
+
+**注意点・落とし穴**:
+- shape/strides の指定を誤るとメモリ範囲外を読んだり、意図せずメモリが重複した配列を作ってしまう非常に危険な API。可能な限り次項の `sliding_window_view` のような安全なラッパーを使うべき。
+
+---
+
+#### `np.lib.stride_tricks.sliding_window_view(x, window_shape, ...)`
+
+**用途**: `as_strided` の安全なラッパーとして、スライディングウィンドウのビューを取得する。
+
+**シグネチャ**: `np.lib.stride_tricks.sliding_window_view(x, window_shape, axis=None, *, subok=False, writeable=False)`
+
+**使用例**:
+```python
+import numpy as np
+a = np.arange(10)
+w = np.lib.stride_tricks.sliding_window_view(a, 3)
+print(w)
+print(w.mean(axis=1))
+```
+実行結果:
+```
+[[0 1 2]
+ [1 2 3]
+ [2 3 4]
+ [3 4 5]
+ [4 5 6]
+ [5 6 7]
+ [6 7 8]
+ [7 8 9]]
+[1. 2. 3. 4. 5. 6. 7. 8.]
+```
+
+**注意点・落とし穴**:
+- 既定で `writeable=False`(読み取り専用のビュー)。移動平均などの計算にそのまま使え、`as_strided` のような手動 stride 計算のミスを避けられる。
+
+---
+
+#### `np.broadcast_to(array, shape)` / `np.broadcast_arrays(*args)`
+
+**用途**: 実データをコピーせず、指定した形状へブロードキャストしたビューを明示的に作る。
+
+**シグネチャ**: `np.broadcast_to(array, shape, subok=False)` / `np.broadcast_arrays(*args, subok=False)`
+
+**使用例**:
+```python
+import numpy as np
+a = np.array([1, 2, 3])
+b = np.broadcast_to(a, (3, 3))
+print(b)
+try:
+    b[0, 0] = 99
+except ValueError as e:
+    print("ValueError:", e)
+
+x = np.array([[1], [2], [3]])
+y = np.array([10, 20])
+bx, by = np.broadcast_arrays(x, y)
+print(bx)
+print(by)
+```
+実行結果:
+```
+[[1 2 3]
+ [1 2 3]
+ [1 2 3]]
+ValueError: assignment destination is read-only
+[[1 1]
+ [2 2]
+ [3 3]]
+[[10 20]
+ [10 20]
+ [10 20]]
+```
+
+**注意点・落とし穴**:
+- `broadcast_to` が返すビューは書き込み不可(read-only)。同じメモリ領域を繰り返し参照しているため、書き込みを許すと整合性が壊れるための仕様。書き込みが必要なら `.copy()` してから使う。
+
+---
+
+### 多項式フィッティング
+
+#### `np.polynomial.Polynomial.fit(x, y, deg)`
+
+**用途**: 与えられたデータ点に指定次数の多項式を最小二乗フィッティングする。
+
+**シグネチャ**: `np.polynomial.Polynomial.fit(x, y, deg, domain=None, rcond=None, full=False, w=None, window=None, symbol='x')`
+
+**使用例**:
+```python
+import numpy as np
+x = np.array([0, 1, 2, 3, 4])
+y = np.array([1, 3, 7, 13, 21])  # y = x^2 + x + 1
+p = np.polynomial.Polynomial.fit(x, y, deg=2)
+print(p.convert().coef)
+print(p(2.5))
+```
+実行結果:
+```
+[1. 1. 1.]
+9.749999999999998
+```
+
+**注意点・落とし穴**:
+- `Polynomial.fit()` は既定で x 軸を `[-1, 1]` に正規化した専用の `domain` 上の係数を保持する。標準的な「定数項・1次・2次…」の係数がほしい場合は `.convert().coef` で変換する必要がある(そのまま `p.coef` を見ると domain 変換後の係数になり直感と異なる)。
+- 古い `np.polyfit`/`np.poly1d` は現在 non-recommended(非推奨方向)とされており、新しいコードでは `np.polynomial.Polynomial` 系の使用が推奨される。
+
+---
+
+#### `Polynomial.roots()` / `.deriv()` / `.integ()`
+
+**用途**: 多項式の根・微分・積分(不定積分)を求める。
+
+**使用例**:
+```python
+import numpy as np
+p = np.polynomial.Polynomial([-6, 1, 1])  # x^2 + x - 6 = (x-2)(x+3)
+print(p.roots())
+d = p.deriv()
+print(d.coef)
+i = p.integ()
+print(i.coef)
+```
+実行結果:
+```
+[-3.  2.]
+[1. 2.]
+[ 0.         -6.          0.5         0.33333333]
+```
+
+**注意点・落とし穴**:
+- `Polynomial([-6, 1, 1])` は係数を低次から高次の順(定数項, 1次, 2次)で渡す。`np.poly1d` の高次から低次の順とは逆順なので混同しやすい。
+
+---
+
+### einsum応用・カスタムufunc
+
+#### `np.einsum(subscripts, *operands)` 応用パターン
+
+**用途**: アインシュタイン縮約記法で転置・トレース・行列積・要素積和・バッチ行列積など多様な演算を1つの関数で表現する。
+
+**シグネチャ**: `np.einsum(*operands, out=None, optimize=False, **kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+a = np.array([[1, 2], [3, 4]])
+b = np.array([[5, 6], [7, 8]])
+
+print(np.einsum('ij->ji', a))          # 転置
+print(np.einsum('ii', a))              # トレース
+print(np.einsum('ij,jk->ik', a, b))    # 行列積
+print(np.einsum('ij,ij->', a, b))      # 要素積の総和
+
+batch_a = np.arange(2*2*3).reshape(2, 2, 3)
+batch_b = np.arange(2*3*2).reshape(2, 3, 2)
+print(np.einsum('bij,bjk->bik', batch_a, batch_b).shape)  # バッチ行列積
+```
+実行結果:
+```
+[[1 3]
+ [2 4]]
+5
+[[19 22]
+ [43 50]]
+70
+(2, 2, 2)
+```
+
+**注意点・落とし穴**:
+- 出力側(`->`の右)に現れない添字は自動的に総和(縮約)される。`'ii'`のように `->` を省略すると、重複しない添字がアルファベット順に出力側とみなされる。
+
+---
+
+#### `np.einsum_path(...)` / `np.einsum(..., optimize=True)`
+
+**用途**: 3つ以上の配列を連鎖的に `einsum` する際、計算順序(縮約パス)を最適化して計算量・中間配列サイズを削減する。
+
+**使用例**:
+```python
+import numpy as np
+a = np.random.default_rng(0).random((30, 40))
+b = np.random.default_rng(1).random((40, 50))
+c = np.random.default_rng(2).random((50, 60))
+
+path_info = np.einsum_path('ij,jk,kl->il', a, b, c, optimize='optimal')
+print(path_info[0])
+r1 = np.einsum('ij,jk,kl->il', a, b, c, optimize=True)
+r2 = np.einsum('ij,jk,kl->il', a, b, c, optimize=False)
+print(np.allclose(r1, r2))
+```
+実行結果:
+```
+['einsum_path', (0, 1), (0, 1)]
+True
+```
+
+**注意点・落とし穴**:
+- `np.einsum` は既定で `optimize=False`(単純に左から右へ評価)。オペランド数が多い・サイズが大きい場合、`optimize=True`(または `'optimal'`)を指定しないと不要に大きな中間配列を作ってしまい遅くなることがある(結果自体は数値的にほぼ同じ)。
+
+---
+
+#### `np.frompyfunc(func, nin, nout)`
+
+**用途**: 任意の Python 関数を、`nin` 個の入力・`nout` 個の出力を持つ ufunc 風のオブジェクトに変換する(ブロードキャストに対応)。
+
+**シグネチャ**: `np.frompyfunc(func, /, nin, nout, **kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+
+def clip_or_double(x):
+    return x * 2 if x < 10 else 10
+
+uf = np.frompyfunc(clip_or_double, 1, 1)
+result = uf(np.array([1, 5, 20]))
+print(result, result.dtype)
+
+def divmod_like(a, b):
+    return a // b, a % b
+
+uf2 = np.frompyfunc(divmod_like, 2, 2)
+q, r = uf2(np.array([7, 9, 11]), 3)
+print(q, r)
+```
+実行結果:
+```
+[2 10 10] object
+[2 3 3] [1 0 2]
+```
+
+**注意点・落とし穴**:
+- 戻り値の dtype は常に `object`(Python オブジェクトの配列)になる。数値 dtype の配列として使いたい場合は `.astype(...)` で変換する。
+- `np.vectorize` と似ているが、`frompyfunc` は複数出力(`nout > 1`)にネイティブ対応する点が異なる。
+
+---
+
+#### `np.vectorize(func, signature=...)`
+
+**用途**: `np.vectorize` の `signature` 引数で、要素ごとではなく「サブ配列ごと」に関数を適用する(汎用 ufunc 的な振る舞い)。
+
+**シグネチャ**: `np.vectorize(pyfunc=<no value>, otypes=None, doc=None, excluded=None, cache=False, signature=None)`
+
+**使用例**:
+```python
+import numpy as np
+
+def normalize_row(row):
+    return row / row.sum()
+
+vnorm = np.vectorize(normalize_row, signature='(n)->(n)')
+a = np.array([[1, 1, 2], [3, 1, 0]], dtype=float)
+print(vnorm(a))
+```
+実行結果:
+```
+[[0.25 0.25 0.5 ]
+ [0.75 0.25 0.  ]]
+```
+
+**注意点・落とし穴**:
+- `signature='(n)->(n)'` は「入力の最後の軸(長さ n)をひとまとめにして受け取り、同じ長さ n の出力を返す」ことを意味する。先頭の余剰軸(この例では行数)には自動的にループ(ブロードキャスト)される。
+
+---
+
+### 高度な線形代数・テストユーティリティ
+
+#### `np.linalg.lstsq(a, b, rcond=None)`
+
+**用途**: 連立方程式が厳密解を持たない(過剰決定系)場合に、最小二乗誤差を最小化する解を求める。
+
+**シグネチャ**: `np.linalg.lstsq(a, b, rcond=None)`
+
+**使用例**:
+```python
+import numpy as np
+x = np.array([0, 1, 2, 3])
+y = np.array([1, 3, 5, 7])
+A = np.vstack([x, np.ones_like(x)]).T
+result = np.linalg.lstsq(A, y, rcond=None)
+m, c = result[0]
+print(m, c)
+print(result[1])  # residuals
+```
+実行結果:
+```
+1.9999999999999996 0.9999999999999993
+[8.66089711e-32]
+```
+
+**注意点・落とし穴**:
+- 戻り値は `(解, 残差平方和, ランク, 特異値)` の4要素タプル。`rcond` は将来のデフォルト変更に関わる引数のため、常に明示的に指定する(`rcond=None` で numpy 推奨の新しい既定動作になる)ことが推奨される。
+
+---
+
+#### `np.linalg.pinv(a)` / `np.linalg.cond(x)` / `np.linalg.matrix_rank(A)`
+
+**用途**: `pinv` は非正方行列・特異行列にも使える疑似逆行列、`cond` は行列の条件数(数値的な安定性の指標)、`matrix_rank` は行列のランクを求める。
+
+**シグネチャ**: `np.linalg.pinv(a, rcond=None, hermitian=False, *, rtol=<no value>)` / `np.linalg.cond(x, p=None)` / `np.linalg.matrix_rank(A, tol=None, hermitian=False, *, rtol=None)`
+
+**使用例**:
+```python
+import numpy as np
+A = np.array([[1., 2.], [3., 4.], [5., 6.]])  # 非正方行列 (3x2)
+pinv = np.linalg.pinv(A)
+print(pinv)
+print(pinv @ A)
+
+print(np.linalg.cond(np.array([[1., 0.], [0., 1e-10]])))
+
+B = np.array([[1, 2, 3], [2, 4, 6], [1, 0, 1]])
+print(np.linalg.matrix_rank(B))
+```
+実行結果:
+```
+[[-1.33333333 -0.33333333  0.66666667]
+ [ 1.08333333  0.33333333 -0.41666667]]
+[[ 1.00000000e+00  6.66133815e-16]
+ [-3.88578059e-16  1.00000000e+00]]
+10000000000.0
+2
+```
+
+**注意点・落とし穴**:
+- `np.linalg.inv` は正方行列かつ非特異行列でしか使えないが、`pinv` は非正方・特異行列でも常に(疑似)逆行列を返す。
+- `cond` が非常に大きい(上記のように `1e10` のオーダー)行列は数値的に不安定で、`np.linalg.solve` などの計算結果に大きな誤差が乗りやすい。
+- 上記 `B` は 3x3 行列だが1列目と3列目が線形従属(3列目 ≈ 1列目 + 定数)のため `matrix_rank` は3ではなく2になる。
+
+---
+
+#### `np.linalg.svd(a)` / `np.linalg.qr(a)`
+
+**用途**: `svd` は特異値分解(次元削減・疑似逆行列の基礎)、`qr` は QR 分解(最小二乗法や直交化の基礎)を行う。
+
+**シグネチャ**: `np.linalg.svd(a, full_matrices=True, compute_uv=True, hermitian=False)` / `np.linalg.qr(a, mode='reduced')`
+
+**使用例**:
+```python
+import numpy as np
+A = np.array([[3., 0.], [0., -2.], [0., 0.]])
+U, S, Vt = np.linalg.svd(A, full_matrices=False)
+print(U.shape, S, Vt.shape)
+recon = U @ np.diag(S) @ Vt
+print(np.allclose(recon, A))
+
+B = np.array([[1., 2.], [3., 4.], [5., 6.]])
+Q, R = np.linalg.qr(B)
+print(Q.shape, R.shape)
+print(np.allclose(Q @ R, B))
+```
+実行結果:
+```
+(3, 2) [3. 2.] (2, 2)
+True
+(3, 2) (2, 2)
+True
+```
+
+**注意点・落とし穴**:
+- `full_matrices=False` で「経済版(thin)」分解になり、`U`/`Vt` が元の行列のランクに合わせた最小サイズになる(既定の `True` だと `U` が正方行列になり無駄に大きくなることがある)。
+- `svd` が返す `S` は対角行列ではなく特異値の1次元配列。行列として使うには `np.diag(S)` で対角行列化する必要がある。
+
+---
+
+#### `np.testing.assert_allclose(actual, desired)` / `np.testing.assert_array_equal(actual, desired)`
+
+**用途**: 浮動小数点の丸め誤差を許容した配列比較(`assert_allclose`)や、要素の完全一致比較(`assert_array_equal`)をユニットテストで行う。
+
+**シグネチャ**: `np.testing.assert_allclose(actual, desired, rtol=1e-07, atol=0, equal_nan=True, err_msg='', verbose=True, *, strict=False)` / `np.testing.assert_array_equal(actual, desired, err_msg='', verbose=True, *, strict=False)`
+
+**使用例**:
+```python
+import numpy as np
+
+a = np.array([1.0, 2.0, 3.0])
+b = np.array([1.0 + 1e-9, 2.0, 3.0 + 1e-9])
+np.testing.assert_allclose(a, b)
+print("assert_allclose OK")
+
+try:
+    np.testing.assert_array_equal(a, b)
+except AssertionError as e:
+    print(str(e))
+```
+実行結果:
+```
+assert_allclose OK
+
+Arrays are not equal
+
+Mismatched elements: 2 / 3 (66.7%)
+Mismatch at indices:
+ [0]: 1.0 (ACTUAL), 1.000000001 (DESIRED)
+ [2]: 3.0 (ACTUAL), 3.000000001 (DESIRED)
+Max absolute difference among violations: 1.00000008e-09
+Max relative difference among violations: 1.00000008e-09
+ ACTUAL: array([1., 2., 3.])
+ DESIRED: array([1., 2., 3.])
+```
+
+**注意点・落とし穴**:
+- `assert_allclose` は既定で `rtol=1e-7`(相対許容誤差)まで許容するため、浮動小数点演算の丸め誤差を含むテストにはこちらを使う。`assert_array_equal` は完全一致を要求するため、計算結果の比較にはほぼ不向き(ビット単位での一致を意図的に確認したい場合のみ使う)。
+
+---
+
+### 乱数の高度な使い方
+
+#### `rng.poisson(lam, size)` / `rng.binomial(n, p, size)`
+
+**用途**: ポアソン分布・二項分布に従う乱数を生成する。
+
+**シグネチャ**: `rng.poisson(lam=1.0, size=None)` / `rng.binomial(n, p, size=None)`
+
+**使用例**:
+```python
+import numpy as np
+rng = np.random.default_rng(42)
+print(rng.poisson(lam=3.0, size=5))
+print(rng.binomial(n=10, p=0.5, size=5))
+```
+実行結果:
+```
+[4 4 5 1 7]
+[5 2 3 6 6]
+```
+
+**注意点・落とし穴**:
+- `Generator` には他にも `gamma`、`dirichlet`、`beta`、`exponential` など多数の分布メソッドがあり、必要な分布に応じて使い分ける(いずれも共通して `size` 引数で出力形状を指定できる)。
+
+---
+
+#### `rng.multivariate_normal(mean, cov, size)`
+
+**用途**: 平均ベクトルと共分散行列を指定した多変量正規分布から乱数を生成する。
+
+**シグネチャ**: `rng.multivariate_normal(mean, cov, size=None, check_valid='warn', tol=1e-08, *, method='svd')`
+
+**使用例**:
+```python
+import numpy as np
+rng = np.random.default_rng(7)
+mean = [0, 5]
+cov = [[1.0, 0.5], [0.5, 2.0]]
+samples = rng.multivariate_normal(mean, cov, size=4)
+print(samples)
+```
+実行結果:
+```
+[[ 0.24646669  4.89988829]
+ [-0.88851305  4.92721005]
+ [-1.07428507  4.71385551]
+ [ 1.13674064  4.62585981]]
+```
+
+**注意点・落とし穴**:
+- `cov` は半正定値行列である必要がある。既定 `check_valid='warn'` では、半正定値でない場合エラーではなく警告のみが出る(明示的にエラーにしたい場合は `check_valid='raise'` を指定する)。
+
+---
+
+#### `np.random.SeedSequence(entropy)` / `SeedSequence.spawn(n)`
+
+**用途**: 並列処理などで複数の独立した(統計的に相関のない)乱数ストリームを、再現性を保ちながら作る。
+
+**シグネチャ**: `np.random.SeedSequence(entropy=None, *, spawn_key=(), pool_size=4, n_children_spawned=0)` / `SeedSequence.spawn(n_children)`
+
+**使用例**:
+```python
+import numpy as np
+ss = np.random.SeedSequence(12345)
+child_seqs = ss.spawn(3)
+rngs = [np.random.default_rng(s) for s in child_seqs]
+for i, r in enumerate(rngs):
+    print(f"stream {i}:", r.random(3))
+```
+実行結果:
+```
+stream 0: [0.86999885 0.56088184 0.22156493]
+stream 1: [0.37707541 0.68954752 0.74347235]
+stream 2: [0.14133926 0.21116801 0.08646818]
+```
+
+**注意点・落とし穴**:
+- 単純に同じ `seed` を複数の `default_rng` に渡したり、`seed` を1ずつ増やして使い回したりすると、ストリーム間に統計的な相関が生じる可能性がある。`SeedSequence.spawn()` を使うことで独立性が担保された子シードを安全に生成でき、マルチプロセス・マルチスレッドでの乱数生成に推奨される方法。
