@@ -14,6 +14,11 @@ seaborn 0.13.2 で検証済み
 6. [ペアプロット・グリッド](#ペアプロットグリッド)
 7. [スタイル・テーマ・カラーパレット](#スタイルテーマカラーパレット)
 8. [データセット・ユーティリティ](#データセットユーティリティ)
+9. [応用・発展](#応用発展)
+    - [新しいオブジェクト指向インターフェース(seaborn.objects)](#新しいオブジェクト指向インターフェースseabornobjects)
+    - [FacetGridの高度なカスタマイズ](#facetgridの高度なカスタマイズ)
+    - [統計的注釈の応用](#統計的注釈の応用)
+    - [カラーパレットの高度な作成](#カラーパレットの高度な作成)
 
 ---
 
@@ -642,3 +647,347 @@ print(tips.shape)
 **注意点・落とし穴**:
 - 実体はGitHub上のCSVをその都度(初回)ダウンロードする実装のため、**インターネット接続が必須**。オフライン環境や社内プロキシ配下では失敗する(`cache=True`がデフォルトなので、一度成功すればローカルにキャッシュされ2回目以降はオフラインでも動く)。
 - 本番データ分析用のデータセットではなく、あくまでドキュメント・チュートリアル・本ドキュメントのような検証用途に限定すべき。
+
+---
+
+## 応用・発展
+
+seaborn 0.13系で整備された、より発展的・ニッチなAPI群。`seaborn.objects`(新しいオブジェクト指向インターフェース、通例 `import seaborn.objects as so` としてインポートする)、既存グリッドクラスの高度な使い方、統計的な注釈の応用、カラーパレットを自作するための低レベルユーティリティを扱う。
+
+### 新しいオブジェクト指向インターフェース(seaborn.objects)
+
+#### `so.Plot(...)` / `.add(...)`
+
+**用途**: `seaborn.objects`(略称 `so`)の中心となるクラス。`Plot(data, x=..., y=..., ...)` でデータとデフォルトの変数マッピングを指定し、`.add(mark)` で描画要素(`so.Dot`/`so.Line`/`so.Bar`等の「マーク」)を追加していく、レイヤーを積み重ねる形の宣言的インターフェース。`relplot`等の関数レベルAPIより低レベルだが、`Axes`ベースの`matplotlib`オブジェクトより高レベルに位置する。
+
+**シグネチャ**: `so.Plot(*args, data=None, x=None, y=None, color=None, alpha=None, fill=None, marker=None, pointsize=None, stroke=None, linewidth=None, linestyle=None, fillcolor=None, fillalpha=None, edgewidth=None, edgestyle=None, edgecolor=None, edgealpha=None, text=None, halign=None, valign=None, offset=None, fontsize=None, xmin=None, xmax=None, ymin=None, ymax=None, group=None)`
+`Plot.add(mark, *transforms, orient=None, legend=True, label=None, data=None, **variables)`
+
+**使用例**:
+```python
+import seaborn as sns
+import seaborn.objects as so
+
+sns.set_theme()
+tips = sns.load_dataset("tips")
+
+p = so.Plot(tips, x="total_bill", y="tip", color="time").add(so.Dot())
+p.save("plot_dot.png", bbox_inches="tight")
+```
+実行結果:
+`scatterplot(hue="time")` とほぼ同じ、Lunch/Dinnerで2色に塗り分けられた散布図が描かれる。`so.Dot()` が「マーク」(matplotlibでいう`Artist`に相当)で、`color="time"` は`Plot`コンストラクタで指定した変数マッピングがそのまま`add`したマークに継承される。
+
+**注意点・落とし穴**:
+- `Plot`オブジェクトはJupyter上では自動的に描画されるが、スクリプトから画像として保存するには`.save(loc, **kwargs)`(内部で`figure.savefig`を呼ぶ)か`.plot()`で`so.Plot`を`Plotter`に変換してから`.figure`を扱う必要があり、`plt.savefig()`をそのまま使うことはできない。
+- `.save()`は`bbox_inches="tight"`を自動では付与しない。`color=`等で凡例が生成される図をそのまま`.save("x.png")`すると、凡例が図の右端で見切れて保存されることを実際に確認した(`bbox_inches="tight"`を明示的に渡すと解消する)。
+
+#### `Plot.facet(...)`
+
+**用途**: `so.Plot`に`row`/`col`によるファセット分割(`FacetGrid`相当の小さい図の格子表示)を追加する。
+
+**シグネチャ**: `Plot.facet(col=None, row=None, order=None, wrap=None)`
+
+**使用例**:
+```python
+p2 = (
+    so.Plot(tips, x="total_bill", y="tip")
+    .facet(col="time", row="smoker")
+    .add(so.Dot())
+)
+p2.save("plot_facet.png", bbox_inches="tight")
+```
+実行結果:
+`smoker`(行)×`time`(列)の2×2パネルに分割された散布図が描かれ、各パネルの上部に`"Yes | Lunch"`のように行・列の値を`|`で連結したタイトルが自動で付く。`relplot(row=..., col=...)`とほぼ同じ結果だが、`Plot`はメソッドチェーンで組み立てる点が異なる。
+
+#### `so.Agg()` / `so.Est()`(Stat)
+
+**用途**: マークを追加する`.add()`にマークと一緒に渡す「Stat(統計変換)」オブジェクト。`so.Agg()`は集計関数(平均など)を適用し、`so.Est()`はさらにブートストラップ等による誤差区間も計算する(`barplot`/`pointplot`が内部で行っている処理に相当)。
+
+**シグネチャ**: `so.Agg(func='mean')` / `so.Est(func='mean', errorbar=('ci', 95), n_boot=1000, seed=None)`
+
+**使用例**:
+```python
+flights = sns.load_dataset("flights")
+p3 = so.Plot(flights, x="year", y="passengers").add(so.Line(), so.Agg())
+p3.save("plot_agg.png", bbox_inches="tight")
+
+p3b = (
+    so.Plot(tips, x="day", y="total_bill", color="sex")
+    .add(so.Dot(), so.Jitter())
+    .add(so.Range(), so.Est(errorbar="sd"))
+)
+p3b.save("plot_est.png", bbox_inches="tight")
+```
+実行結果:
+`p3`は年ごとの`passengers`の平均値(月別の重複を`so.Agg()`が平均に集約)を結んだ右肩上がりの1本の折れ線になる。`p3b`は曜日ごとに男女別の点群(ジッターあり)の上に、`so.Est(errorbar="sd")`による標準偏差の範囲を示す縦線(`so.Range`)が重ねて描かれる。
+
+**注意点・落とし穴**:
+- `so.Agg`/`so.Est`はあくまで「Stat」であり、それ単体では描画されない。`.add(mark, stat)`のように必ずマークとセットで`.add()`に渡す必要がある。
+
+#### `so.Dodge()` / `so.Stack()`(Move)
+
+**用途**: `.add()`にマーク・Statと一緒に渡す「Move(位置調整)」オブジェクト。`so.Dodge()`は重なる要素を左右にずらして並べ(`barplot`の`dodge`相当)、`so.Stack()`は積み上げる(棒グラフを積み上げ式にする)。
+
+**シグネチャ**: `so.Dodge(empty='keep', gap=0, by=None)` / `so.Stack()`
+
+**使用例**:
+```python
+p4 = (
+    so.Plot(tips, x="day", y="total_bill", color="sex")
+    .add(so.Bar(), so.Agg(), so.Dodge())
+)
+p4.save("plot_dodge.png", bbox_inches="tight")
+
+p4b = (
+    so.Plot(tips, x="day", color="smoker")
+    .add(so.Bar(), so.Count(), so.Stack())
+)
+p4b.save("plot_stack.png", bbox_inches="tight")
+```
+実行結果:
+`p4`は曜日ごとに男女別の平均`total_bill`の棒が左右に並んで(dodge)描かれる。`p4b`は曜日ごとの来店件数(`so.Count()`)が`smoker`の有無で下から積み上げられた棒グラフになる。
+
+**注意点・落とし穴**:
+- `.add()`に渡すTransform(Stat/Move)は左から右へ順番に適用されるパイプラインなので、`so.Dodge()`を先に書くか後に書くかで結果が変わりうる(集計してから並べ替えるのが基本)。
+
+#### `Plot.pair(...)`
+
+**用途**: 複数のx変数・y変数の組み合わせについて、`pairplot`のようなサブプロット群を`so.Plot`のメソッドチェーンで組み立てる。
+
+**シグネチャ**: `Plot.pair(x=None, y=None, wrap=None, cross=True)`
+
+**使用例**:
+```python
+penguins = sns.load_dataset("penguins")
+p5 = (
+    so.Plot(penguins, color="species")
+    .pair(x=["bill_length_mm", "bill_depth_mm"], y=["flipper_length_mm"])
+    .add(so.Dot())
+)
+p5.save("plot_pair.png", bbox_inches="tight")
+```
+実行結果:
+`bill_length_mm`/`bill_depth_mm`(x軸候補)× `flipper_length_mm`(y軸)の組み合わせで横に2枚並んだ散布図が描かれ、それぞれ`species`ごとに色分けされる。`pairplot`と違い、x側とy側の変数リストを個別に指定できるため全組み合わせ(正方行列)にならない図を作れる。
+
+---
+
+### FacetGridの高度なカスタマイズ
+
+#### `FacetGrid.map_dataframe(...)`
+
+**用途**: `FacetGrid.map()`は列名を位置引数(ベクトル)として受け取る関数しか使えないが、`map_dataframe()`はファセットごとの**部分DataFrameそのもの**を`data=`引数として渡す。行相関やサンプル数など、複数列にまたがる統計量をファセットごとに計算して注釈したい場合に使う。
+
+**シグネチャ**: `FacetGrid.map_dataframe(func, *args, **kwargs)`
+
+**使用例**:
+```python
+import matplotlib.pyplot as plt
+
+def annotate_corr(data, **kwargs):
+    r = data["total_bill"].corr(data["tip"])
+    plt.gca().text(0.05, 0.9, f"r={r:.2f}", transform=plt.gca().transAxes)
+
+g6 = sns.FacetGrid(tips, col="time")
+g6.map_dataframe(sns.scatterplot, x="total_bill", y="tip")
+g6.map_dataframe(annotate_corr)
+g6.savefig("map_dataframe.png")
+```
+実行結果:
+Lunch/Dinnerの2パネルに散布図が描かれたうえで、各パネル左上に`annotate_corr`が計算した`total_bill`と`tip`の相関係数(`r=0.81`/`r=0.63`)がテキストとして注釈される。`annotate_corr`は`data`(そのファセットの部分DataFrame全体)を受け取れるため、単一列のベクトルだけでは計算できない列間の統計量を扱える。
+
+**注意点・落とし穴**:
+- `map_dataframe`に渡す関数は`data`という名前のキーワード引数を受け取れる必要がある(`sns.scatterplot`のように`data=`対応の関数はそのまま渡せるが、独自関数を書く場合は`def f(data, **kwargs):`のシグネチャにする)。
+
+#### `FacetGrid.refline(...)`
+
+**用途**: 各ファセットに水平線・垂直線の参照線(基準線)をまとめて引く。全体平均や閾値をすべてのパネルに一括で重ねたいときに便利。
+
+**シグネチャ**: `FacetGrid.refline(*, x=None, y=None, color='.5', linestyle='--', **line_kws)`
+
+**使用例**:
+```python
+g7 = sns.FacetGrid(tips, col="day", col_wrap=2)
+g7.map_dataframe(sns.histplot, x="total_bill")
+g7.refline(x=tips["total_bill"].mean(), color="red", linestyle="--")
+g7.savefig("refline.png")
+```
+実行結果:
+曜日ごと(2×2に折り返し)のヒストグラムそれぞれに、`total_bill`の全体平均位置を示す赤い破線の垂直線が共通して重ねて描かれ、各曜日の分布が全体平均よりどちらに偏っているかが一目でわかる。
+
+#### `FacetGrid.set_titles(...)` / `set_axis_labels(...)` / `tight_layout(...)`
+
+**用途**: ファセットごとのタイトル文字列のテンプレートを変更したり(`set_titles`)、全パネル共通の軸ラベルをまとめて設定したり(`set_axis_labels`)、パネル間の余白を自動調整したり(`tight_layout`)する、仕上げ用のメソッド群。
+
+**シグネチャ**: `FacetGrid.set_titles(template=None, row_template=None, col_template=None, **kwargs)`
+
+**使用例**:
+```python
+g8 = sns.FacetGrid(tips, col="time", row="smoker")
+g8.map_dataframe(sns.scatterplot, x="total_bill", y="tip")
+g8.set_titles(row_template="smoker={row_name}", col_template="{col_name}")
+g8.set_axis_labels("total bill (USD)", "tip (USD)")
+g8.tight_layout()
+g8.savefig("set_titles.png")
+```
+実行結果:
+デフォルトの`"smoker = Yes | time = Lunch"`のような冗長なタイトルが、`row_template`/`col_template`の指定により`"smoker=Yes | Lunch"`という簡潔な表記に変わり、x軸・y軸ラベルも全パネル共通で`"total bill (USD)"`/`"tip (USD)"`に置き換わる。
+
+---
+
+### 統計的注釈の応用
+
+#### `so.PolyFit()`
+
+**用途**: `so.Plot`の`.add()`に渡すStatの1つ。散布データに指定次数の多項式回帰を当てはめた曲線を描く(`regplot(order=2)`相当の処理を`objects`インターフェースで行う)。
+
+**シグネチャ**: `so.PolyFit(order=2, gridsize=100)`
+
+**使用例**:
+```python
+healthexp = sns.load_dataset("healthexp")
+p9 = (
+    so.Plot(healthexp, x="Year", y="Life_Expectancy", color="Country")
+    .add(so.Dots())
+    .add(so.Line(), so.PolyFit(order=2))
+)
+p9.save("polyfit.png", bbox_inches="tight")
+```
+実行結果:
+国別(5カ国)に色分けされた「年×平均寿命」の実測点(`so.Dots()`)の上に、国ごとに2次多項式でフィットした滑らかな曲線が重ねて描かれ、どの国も右肩上がりだが2000年代以降に伸びが鈍化する曲線カーブの違いが比較できる。
+
+#### `so.Range()` + `so.Est()`
+
+**用途**: 集計した代表値(`so.Agg`/`so.Dot`等)に、`so.Est()`が計算した誤差区間を`so.Range()`という専用マークで別レイヤーとして重ねる。`barplot`のエラーバーを`objects`インターフェースで自前に組み立てる形。
+
+**シグネチャ**: `so.Range(color='C0', alpha=1, linewidth=<rc:lines.linewidth>, linestyle=<rc:lines.linestyle>)`
+
+**使用例**:
+```python
+p10 = (
+    so.Plot(tips, x="day", y="total_bill", color="sex")
+    .add(so.Dot(), so.Agg(), so.Dodge())
+    .add(so.Range(), so.Est(errorbar="ci"), so.Dodge())
+)
+p10.save("range_est.png", bbox_inches="tight")
+```
+実行結果:
+曜日×性別ごとに平均`total_bill`を示す点(`so.Dot`)と、その95%信頼区間を示す縦線(`so.Range`)が同じ位置に重なって描かれる。点用と誤差区間用の2つの`.add()`にそれぞれ`so.Dodge()`を付ける必要があり、片方にだけ付けると点と誤差線の横位置がずれる。
+
+**注意点・落とし穴**:
+- 点(`so.Dot`+`so.Agg`)と誤差区間(`so.Range`+`so.Est`)は別々の`.add()`呼び出しであるため、`so.Dodge()`のような位置調整(Move)も**両方に**個別に指定しないと、dodgeされた点の真下に誤差線が来ず横方向にずれる。
+
+#### `so.Text()`
+
+**用途**: 集計値などをマーク(棒・点)の上にテキストとして直接注記する。`barplot`に値ラベルを付けたい場合などに使う。
+
+**シグネチャ**: `so.Text(text='', color='k', alpha=1, fontsize=<rc:font.size>, halign='center', valign='center_baseline', offset=4)`
+
+**使用例**:
+```python
+agg = tips.groupby("day", observed=True)["total_bill"].mean().round(1).reset_index()
+p11 = (
+    so.Plot(agg, x="day", y="total_bill", text="total_bill")
+    .add(so.Bar())
+    .add(so.Text(color="w", valign="top"))
+)
+p11.save("text.png", bbox_inches="tight")
+```
+実行結果:
+曜日ごとの平均`total_bill`を表す棒グラフの上部(`valign="top"`)に、白色で`17.7`/`17.2`/`20.4`/`21.4`という集計値そのものがテキストラベルとして各棒に1つずつ表示される。
+
+**注意点・落とし穴**:
+- 先に`tips`を直接`so.Plot(tips, ...).add(so.Bar(), so.Agg()).add(so.Text(...), so.Agg(), text="total_bill")`のように**集計前の生データ**に`so.Agg()`を付けて試したところ、棒の高さ(y)は正しく集計されるのに、テキストラベルは集計されず元の全行の`total_bill`の値がすべて同じx位置に重ねて描画され、文字が大量に重なり判読不能になることを実際に確認した。`so.Text`に渡す`text=`変数は`so.Agg`等のStatによる集計の対象にならないため、テキストで見せたい値は`groupby`等で**事前に集計したDataFrーム**を`so.Plot`に渡すのが安全。
+
+#### `so.Area()` + `so.KDE()`
+
+**用途**: `so.Area()`マークと`so.KDE()`(Stat)を組み合わせて、`kdeplot(fill=True)`相当の塗りつぶしカーネル密度推定を`objects`インターフェースで描く。
+
+**シグネチャ**: `so.Area(color='C0', alpha=0.2, fill=True, edgecolor=<depend:color>, edgealpha=1, edgewidth=<rc:patch.linewidth>, edgestyle='-', baseline=0)` / `so.KDE(bw_adjust=1, bw_method='scott', common_norm=True, common_grid=True, gridsize=200, cut=3, cumulative=False)`
+
+**使用例**:
+```python
+p12 = so.Plot(tips, x="total_bill", color="time").add(so.Area(), so.KDE())
+p12.save("area_kde.png", bbox_inches="tight")
+```
+実行結果:
+`kdeplot(data=tips, x="total_bill", hue="time", fill=True)`とほぼ同じ、Lunch/Dinner2色の塗りつぶしKDE曲線が重なって描かれる。`common_norm=True`(デフォルト)のため、サンプル数の多いDinnerの山がLunchより高く描かれる。
+
+---
+
+### カラーパレットの高度な作成
+
+#### `sns.blend_palette(...)`
+
+**用途**: 任意の色のリストを指定し、それらを滑らかに補間したグラデーションパレット(または連続カラーマップ)を作る。2色発散パレット(`diverging_palette`)や単色グラデーション(`light_palette`)では表現できない、3色以上の任意配色のカラーマップを自作したいときに使う。
+
+**シグネチャ**: `sns.blend_palette(colors, n_colors=6, as_cmap=False, input='rgb')`
+
+**使用例**:
+```python
+pal = sns.blend_palette(["midnightblue", "gold", "crimson"], n_colors=9)
+print(pal.as_hex())
+
+cmap = sns.blend_palette(["midnightblue", "gold", "crimson"], as_cmap=True)
+flights_wide = sns.load_dataset("flights").pivot(index="month", columns="year", values="passengers")
+sns.heatmap(flights_wide, cmap=cmap)
+plt.savefig("blend_cmap_heatmap.png")
+```
+実行結果:
+```
+['#191970', '#534954', '#8c7838', '#c6a81c', '#ffd600', '#f6a50f', '#ed741e', '#e5432d', '#dc143c']
+```
+`blend_palette`は紺(`midnightblue`)→金(`gold`)→深紅(`crimson`)へ滑らかに変化する9色のパレットを返す。`as_cmap=True`にした`cmap`を`heatmap`の`cmap=`にそのまま渡すと、乗客数が少ないセルほど紺、多いセルほど赤みがかった配色のヒートマップになる。
+
+**注意点・落とし穴**:
+- `light_palette`/`dark_palette`/`diverging_palette`は色の指定が1〜2色に限定されるが、`blend_palette`は3色以上のリストを渡せる唯一の組み込みパレット生成関数で、ブランドカラーなど任意の配色を再現したい場合に選ぶ。
+
+#### `sns.mpl_palette(...)` / `sns.xkcd_palette(...)`
+
+**用途**: `mpl_palette`はmatplotlib組み込みのカラーマップ名(`"plasma"`等、`color_palette`にも同名指定が効くが引数構成がシンプル)からパレットを取得する。`xkcd_palette`はxkcdの色名調査に基づく954色の俗称カラー名(`"windows blue"`等)からパレットを作る。
+
+**シグネチャ**: `sns.mpl_palette(name, n_colors=6, as_cmap=False)` / `sns.xkcd_palette(colors)`
+
+**使用例**:
+```python
+pal_mpl = sns.mpl_palette("plasma", 8)
+pal_xkcd = sns.xkcd_palette(["windows blue", "amber", "faded green", "dusty purple"])
+print(pal_mpl.as_hex())
+print(pal_xkcd.as_hex())
+```
+実行結果:
+```
+['#46039f', '#7201a8', '#9c179e', '#bd3786', '#d8576b', '#ed7953', '#fb9f3a', '#fdca26']
+['#3778bf', '#feb308', '#7bb274', '#825f87']
+```
+`mpl_palette("plasma", 8)`は紫→ピンク→オレンジ→黄へ変化する8色。`xkcd_palette`は指定した4つの色名(青・琥珀色・淡緑・くすんだ紫)にそれぞれ対応する単色4色のパレットになる。
+
+**注意点・落とし穴**:
+- `xkcd_palette`に渡せる色名はxkcdの命名規則に従う必要があり、存在しない名前を渡すと`ValueError`になる(利用可能な全色名は`matplotlib.colors.XKCD_COLORS`で確認できる)。
+
+#### `sns.desaturate(...)` / `sns.saturate(...)` / `sns.set_hls_values(...)`
+
+**用途**: パレット全体ではなく、単一の色そのものを加工するユーティリティ。`desaturate`は彩度を指定割合まで下げ、`saturate`は彩度を最大(100%)にし、`set_hls_values`はHLS(色相・輝度・彩度)の任意の成分だけを書き換える。
+
+**シグネチャ**: `sns.desaturate(color, prop)` / `sns.saturate(color)` / `sns.set_hls_values(color, h=None, l=None, s=None)`
+
+**使用例**:
+```python
+base = "seagreen"
+colors = [
+    sns.desaturate(base, 0.3),
+    base,
+    sns.saturate(base),
+    sns.set_hls_values(base, l=0.8),
+]
+print(colors)
+sns.palplot(colors)
+plt.savefig("desaturate.png")
+```
+実行結果:
+```
+[(0.308, 0.417, 0.356), 'seagreen', (0.0, 0.725, 0.320), (0.699, 0.901, 0.788)]
+```
+左から、元の`"seagreen"`より彩度を70%落としてくすませた灰緑、元の`seagreen`そのもの、彩度を100%まで上げた鮮やかな緑、輝度を0.8まで上げた淡いパステル緑の4色が横に並んで表示される。
+
+**注意点・落とし穴**:
+- いずれも1色ずつを変換する関数であり、`color_palette`のようなパレット(色のリスト)ではなく単一のRGBタプル/色名を受け取る。パレット全体に適用したい場合はリスト内包表記で1色ずつ回す必要がある。

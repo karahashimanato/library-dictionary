@@ -13,6 +13,11 @@ optuna 4.9.0 で検証済み。すべてのシグネチャ・実行結果は `/h
 7. [マルチ目的最適化](#7-マルチ目的最適化)
 8. [永続化(Storage)](#8-永続化storage)
 9. [その他(コールバック・実行制御)](#9-その他コールバック実行制御)
+10. [制約付き・条件付き最適化](#10-制約付き条件付き最適化)
+11. [Study間のコピー・マージ](#11-study間のコピーマージ)
+12. [コールバックの応用パターン](#12-コールバックの応用パターン)
+13. [Artifact機能](#13-artifact機能)
+14. [ウォームスタートの応用](#14-ウォームスタートの応用)
 
 ---
 
@@ -1048,3 +1053,566 @@ add_trial後のn_trials: 1 {'x': 3.0} 1.0
 **注意点・落とし穴**:
 - `params`と`distributions`のキーは一致している必要があり、`distributions`には実際に`suggest_float`などで使うのと同じ`Distribution`オブジェクト(`FloatDistribution`/`IntDistribution`/`CategoricalDistribution`など)を渡す。
 - 過去の実験結果を取り込んでから`study.optimize()`を呼べば、サンプラーはこの追加済み試行も踏まえて次の提案を行う(TPESamplerなど、履歴を使う手法で特に有効)。
+
+---
+
+## 応用・発展
+
+## 10. 制約付き・条件付き最適化
+
+### `constraints_func`(制約付き最適化)
+
+**用途**: 目的関数の値とは別に「制約を満たすか」をサンプラーに伝え、実行可能領域(制約を満たす領域)を優先的に探索させる。`TPESampler`・`NSGAIISampler`など複数のサンプラーが`constraints_func`引数を共通して持つ。
+
+**シグネチャ**: `constraints_func: Callable[[FrozenTrial], Sequence[float]]` を`TPESampler(..., constraints_func=...)`のように渡す。各要素が0以下なら実行可能、正なら制約違反とみなされる。
+
+**使用例**:
+```python
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -5, 5)
+    y = trial.suggest_float('y', -5, 5)
+    # 制約: x + y <= 1 (満たされていれば c <= 0)
+    c = (x + y) - 1
+    trial.set_user_attr('constraint', (c,))
+    return x ** 2 + y ** 2
+
+def constraints_func(trial):
+    return trial.user_attrs['constraint']
+
+sampler = optuna.samplers.TPESampler(seed=0, constraints_func=constraints_func)
+study = optuna.create_study(sampler=sampler)
+study.optimize(objective, n_trials=30)
+
+feasible = [t for t in study.trials if t.user_attrs['constraint'][0] <= 0]
+print('feasible trials:', len(feasible), '/', len(study.trials))
+print('best (feasible) params:', study.best_params, 'value:', round(study.best_value, 4))
+print('best trial constraint value:', study.best_trial.user_attrs['constraint'])
+```
+実行結果:
+```
+feasible trials: 21 / 30
+best (feasible) params: {'x': -0.058038567660368856, 'y': -0.22260424354632957} value: 0.0529
+best trial constraint value: (-1.2806428112066985,)
+```
+
+**注意点・落とし穴**:
+- optunaの`constraints_func`自体は制約値をサンプラーに渡す仕組みでしかなく、制約違反の試行を`study.optimize()`が自動的に除外・打ち切りするわけではない(この例のように、通常どおり最後まで評価され`COMPLETE`になる)。実行可能解だけを見たい場合は本例のように`trial.user_attrs`から手動でフィルタする必要がある。
+- 制約値は`objective`の中で計算して`trial.set_user_attr(...)`などに保存し、`constraints_func`側でそれを読み出す、という2段構えの実装がよく使われる(`constraints_func`は`FrozenTrial`しか受け取れず、目的関数の計算過程には直接アクセスできないため)。
+- `TPESampler`で`constraints_func`を使うと`ExperimentalWarning: Argument constraints_func is an experimental feature.`が出る(実行して確認済み)。将来のバージョンでインターフェースが変わる可能性がある。
+
+### `NSGAIISampler(constraints_func=...)` と `plot_pareto_front(..., constraints_func=...)`
+
+**用途**: 多目的最適化と制約付き最適化を組み合わせ、パレートフロントを「実行可能な解の中」から求める。可視化側にも同じ`constraints_func`を渡すと、実行不可能な試行を区別して描画できる。
+
+**シグネチャ**: `optuna.visualization.plot_pareto_front(study, *, target_names=None, include_dominated_trials=True, axis_order=None, constraints_func=None, targets=None) -> go.Figure`
+
+**使用例**:
+```python
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', 0, 5)
+    y = trial.suggest_float('y', 0, 3)
+    c = (x - 3) ** 2 + (y - 1) ** 2 - 2  # <=0 なら実行可能
+    trial.set_user_attr('constraint', (c,))
+    return 4 * x ** 2 + 4 * y ** 2, (x - 5) ** 2 + (y - 5) ** 2
+
+def constraints_func(trial):
+    return trial.user_attrs['constraint']
+
+sampler = optuna.samplers.NSGAIISampler(seed=0, population_size=10, constraints_func=constraints_func)
+study = optuna.create_study(directions=['minimize', 'minimize'], sampler=sampler)
+study.optimize(objective, n_trials=30)
+
+feasible = [t for t in study.trials if t.user_attrs['constraint'][0] <= 0]
+print('feasible:', len(feasible), '/', len(study.trials))
+print('pareto front size (best_trials):', len(study.best_trials))
+
+fig = optuna.visualization.plot_pareto_front(study, constraints_func=constraints_func, target_names=['v0', 'v1'])
+print(type(fig))
+```
+実行結果:
+```
+feasible: 18 / 30
+pareto front size (best_trials): 10
+<class 'plotly.graph_objs._figure.Figure'>
+```
+
+**注意点・落とし穴**:
+- `study.best_trials`(パレートフロント)は、`constraints_func`を`NSGAIISampler`側に渡しているかどうかに関わらず、単に非劣解の集合を返す。制約違反の試行が`best_trials`に混ざりうる点は`plot_pareto_front`に`constraints_func`を渡す理由(実行不可能な点をマーカーで区別する)につながる。
+- 目的が2つ・3つまでしか散布図として描画できない(既存の`plot_pareto_front`の注意点と同じ)。
+
+### `optuna.samplers.PartialFixedSampler(...)`
+
+**用途**: 探索空間の一部のパラメータを固定値に固定したまま、残りのパラメータだけを別のサンプラー(`base_sampler`)で最適化する。「他のパラメータは確定済みで、あるパラメータだけ追加調整したい」場面に使う。
+
+**シグネチャ**: `optuna.samplers.PartialFixedSampler(fixed_params: dict[str, Any], base_sampler: BaseSampler) -> None`
+
+**使用例**:
+```python
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    y = trial.suggest_float('y', -10, 10)
+    return (x - 2) ** 2 + (y + 3) ** 2
+
+base_sampler = optuna.samplers.TPESampler(seed=0)
+sampler = optuna.samplers.PartialFixedSampler(fixed_params={'y': 0.0}, base_sampler=base_sampler)
+
+study = optuna.create_study(sampler=sampler)
+study.optimize(objective, n_trials=10)
+y_values = {t.params['y'] for t in study.trials}
+print('distinct y values used:', y_values)
+print('best_params:', study.best_params)
+```
+実行結果:
+```
+distinct y values used: {0.0}
+best_params: {'x': 2.055267521432878, 'y': 0.0}
+```
+
+**注意点・落とし穴**:
+- `fixed_params`で指定した名前のパラメータでも、目的関数内では通常どおり`trial.suggest_float('y', ...)`のように呼び出す必要がある(呼び出し自体は必須で、`PartialFixedSampler`がその呼び出し結果を固定値にすり替える仕組み)。
+- optuna 4.9.0時点で`ExperimentalWarning: PartialFixedSampler is experimental (supported from v2.4.0). The interface can change in the future.`という警告が出る(実行して確認済み)。
+
+---
+
+## 11. Study間のコピー・マージ
+
+### `optuna.copy_study(...)`
+
+**用途**: 既存のStudy(全試行・パラメータ・設定)を、別のストレージ・別名で丸ごと複製する。DBのバックアップや、本番用DBへの移行に使う。
+
+**シグネチャ**: `optuna.copy_study(*, from_study_name: str, from_storage: str | storages.BaseStorage, to_storage: str | storages.BaseStorage, to_study_name: str | None = None) -> None`
+
+**使用例**:
+```python
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    return (x - 2) ** 2
+
+study = optuna.create_study(study_name='copy-src', storage='sqlite:///copy_src.db', load_if_exists=True)
+study.optimize(objective, n_trials=10)
+
+optuna.copy_study(
+    from_study_name='copy-src',
+    from_storage='sqlite:///copy_src.db',
+    to_storage='sqlite:///copy_dst.db',
+    to_study_name='copy-dst',
+)
+copied = optuna.load_study(study_name='copy-dst', storage='sqlite:///copy_dst.db')
+print('source n_trials:', len(study.trials), '/ copied n_trials:', len(copied.trials))
+print('best_value一致:', study.best_value == copied.best_value)
+```
+実行結果:
+```
+source n_trials: 10 / copied n_trials: 10
+best_value一致: True
+```
+
+**注意点・落とし穴**:
+- `to_study_name`を省略すると、コピー元と同じ`study_name`が使われる。コピー先のストレージに同名Studyが既に存在すると`DuplicatedStudyError`になる。
+- 試行だけでなく`user_attrs`/`system_attrs`/サンプラーの状態なども含めてコピーされる(単なる`trials_dataframe`のエクスポートとは異なり、コピー先でも通常のStudyとして`optimize`を継続できる)。
+
+### `optuna.delete_study(...)`
+
+**用途**: 指定したストレージから、指定した名前のStudyを完全に削除する。
+
+**シグネチャ**: `optuna.delete_study(*, study_name: str, storage: str | storages.BaseStorage) -> None`
+
+**使用例**:
+```python
+import optuna
+print('削除前:', optuna.study.get_all_study_names('sqlite:///copy_dst.db'))
+optuna.delete_study(study_name='copy-dst', storage='sqlite:///copy_dst.db')
+print('削除後:', optuna.study.get_all_study_names('sqlite:///copy_dst.db'))
+```
+実行結果:
+```
+削除前: ['copy-dst']
+削除後: []
+```
+
+**注意点・落とし穴**:
+- 削除は即座に反映され、取り消せない。前項の`copy_study`でバックアップを取ってから、元のStudyを整理する、といった使い方が安全。
+- 存在しない`study_name`を指定すると`KeyError`になる(事前に`get_all_study_names`で存在確認するのが安全)。
+
+### 複数Studyの試行をマージする(`Study.add_trial`)
+
+**用途**: 共有ストレージを使わずに別々に実行した複数のStudy(例: 異なるマシンでの並列実行結果)の試行履歴を、後から1つのStudyにまとめる。
+
+**シグネチャ**: 専用のマージAPIはなく、`Study.add_trial(self, trial: FrozenTrial) -> None`をループで呼び出して実現する。
+
+**使用例**:
+```python
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    return (x - 2) ** 2
+
+# 独立した2つのStudy(例: 別マシンで動かした結果を想定)
+study_a = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=0))
+study_a.optimize(objective, n_trials=5)
+study_b = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=1))
+study_b.optimize(objective, n_trials=5)
+
+# 2つのStudyの全試行を1つの新しいStudyにマージ
+merged = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=0))
+for src in (study_a, study_b):
+    for t in src.trials:
+        merged.add_trial(
+            optuna.trial.create_trial(params=t.params, distributions=t.distributions, value=t.value)
+        )
+print('study_a:', len(study_a.trials), 'study_b:', len(study_b.trials), '-> merged:', len(merged.trials))
+print('merged best_value:', round(merged.best_value, 4))
+```
+実行結果:
+```
+study_a: 5 study_b: 5 -> merged: 10
+merged best_value: 0.0031
+```
+
+**注意点・落とし穴**:
+- `copy_study`は「1つのStudyの複製」であり複数Studyの統合はできない。複数の情報源をまとめたい場合は本例のように`add_trial`を手動でループするしかない。
+- マージ後に`merged.optimize(...)`を呼べば、TPESamplerなどはマージされた全試行の履歴を踏まえて次の提案を行う(「14. ウォームスタートの応用」の考え方と同じ仕組み)。
+
+---
+
+## 12. コールバックの応用パターン
+
+### 自作の早期終了コールバック(`Study.stop()`活用)
+
+**用途**: 「直近N回、ベスト値が更新されなければ打ち切る」といった、`n_trials`や`timeout`だけでは表現できない終了条件をコールバックとして自作する。
+
+**シグネチャ**: コールバックは`Callable[[Study, FrozenTrial], None]`の形(「9. その他」の`Study.optimize(..., callbacks=[...])`と同じ)。内部で条件を満たしたときに`study.stop()`を呼ぶ。
+
+**使用例**:
+```python
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    return (x - 2) ** 2
+
+class EarlyStoppingCallback:
+    """直近 patience 回、ベスト値が更新されなければ study.stop() を呼ぶ。"""
+    def __init__(self, patience):
+        self.patience = patience
+        self.best_value = None
+        self.no_improve_count = 0
+
+    def __call__(self, study, trial):
+        if self.best_value is None or study.best_value < self.best_value:
+            self.best_value = study.best_value
+            self.no_improve_count = 0
+        else:
+            self.no_improve_count += 1
+        if self.no_improve_count >= self.patience:
+            study.stop()
+
+study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=0))
+study.optimize(objective, n_trials=200, callbacks=[EarlyStoppingCallback(patience=10)])
+print('n_trials (early stopped):', len(study.trials))
+print('best_value:', round(study.best_value, 6))
+```
+実行結果:
+```
+n_trials (early stopped): 13
+best_value: 0.003054
+```
+
+**注意点・落とし穴**:
+- `n_trials=200`を指定していても、13試行で打ち切られている(実行して確認済み)。`Study.stop()`は「その試行が完了した後」にループを止めるため、コールバック内で呼んでも当該試行自体は最後まで実行される。
+- クラス(`__call__`を実装したインスタンス)をコールバックとして使うと、`patience`や`best_value`などの状態をクロージャなしで保持できる。関数ベースだと`nonlocal`や外部の可変オブジェクトが必要になる。
+
+### 複数コールバックの併用
+
+**用途**: `callbacks`引数にはリストで複数のコールバックを渡せる。ロギング用・停止条件用などを組み合わせる場合、呼び出し順序を把握しておく必要がある。
+
+**シグネチャ**: `Study.optimize(self, func, ..., callbacks=None, ...) -> None`(`callbacks`はリスト。各試行完了後、リストの先頭から順に呼ばれる)
+
+**使用例**:
+```python
+import optuna
+from optuna.trial import TrialState
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    return (x - 2) ** 2
+
+order = []
+
+def logging_callback(study, trial):
+    order.append(('log', trial.number))
+
+max_trials_cb = optuna.study.MaxTrialsCallback(3, states=(TrialState.COMPLETE,))
+
+def wrapped_max_trials(study, trial):
+    order.append(('max_trials_check', trial.number))
+    max_trials_cb(study, trial)
+
+study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=0))
+study.optimize(objective, n_trials=100, callbacks=[logging_callback, wrapped_max_trials])
+print('n_trials:', len(study.trials))
+print('callback call order (first 8):', order[:8])
+```
+実行結果:
+```
+n_trials: 3
+callback call order (first 8): [('log', 0), ('max_trials_check', 0), ('log', 1), ('max_trials_check', 1), ('log', 2), ('max_trials_check', 2)]
+```
+
+**注意点・落とし穴**:
+- `callbacks=[a, b]`と渡すと、1試行終わるごとに`a`→`b`の順で呼ばれることが実行結果から確認できる。停止判定(`MaxTrialsCallback`など)を他のコールバックより後ろに置けば、それより前のコールバック(ロギングなど)は停止直前の試行でも確実に実行される。
+
+### コールバックはCOMPLETE以外の状態でも呼ばれる
+
+**用途**: `callbacks`は`COMPLETE`(正常終了)した試行だけでなく、`PRUNED`(打ち切り)や`FAIL`(例外)で終わった試行でも呼び出される、という見落としやすい挙動を確認する。
+
+**シグネチャ**: コールバックは`Callable[[Study, FrozenTrial], None]`。渡される`FrozenTrial`の`state`属性で状態を判定できる。
+
+**使用例**:
+```python
+import optuna
+from optuna.trial import TrialState
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    if x < 0:
+        raise optuna.TrialPruned()
+    return (x - 2) ** 2
+
+def state_logger(study, trial):
+    print(f'callback: trial={trial.number} state={trial.state.name}')
+
+study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=0))
+study.optimize(objective, n_trials=5, callbacks=[state_logger])
+```
+実行結果:
+```
+callback: trial=0 state=COMPLETE
+callback: trial=1 state=COMPLETE
+callback: trial=2 state=COMPLETE
+callback: trial=3 state=COMPLETE
+callback: trial=4 state=PRUNED
+```
+
+**注意点・落とし穴**:
+- trial 4は`TrialPruned`で打ち切られているが、コールバックは呼ばれ`state=PRUNED`が渡ってきている(実行して確認済み)。「完了した試行のときだけ集計したい」ようなコールバックを書く場合は、`if trial.state != optuna.trial.TrialState.COMPLETE: return`のような明示的なガードが必要(`MaxTrialsCallback`が`states`引数を持つのもこのため)。
+
+---
+
+## 13. Artifact機能
+
+### `optuna.artifacts.FileSystemArtifactStore` と `optuna.artifacts.upload_artifact(...)`
+
+**用途**: 学習済みモデルのファイルや画像・ログなど、数値では表せない「成果物」をTrial/Studyに紐づけて保存する。`FileSystemArtifactStore`はローカルディスク上のディレクトリを保存先とするバックエンド(他に`Boto3ArtifactStore`/`GCSArtifactStore`もある)。
+
+**シグネチャ**: `optuna.artifacts.FileSystemArtifactStore(base_path: str | Path) -> None` / `optuna.artifacts.upload_artifact(*, artifact_store: ArtifactStore, file_path: str, study_or_trial: Trial | FrozenTrial | Study, storage: BaseStorage | None = None, mimetype: str | None = None, encoding: str | None = None) -> str`
+
+**使用例**:
+```python
+import optuna, os
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+base_path = '/tmp/optuna_artifacts/store'
+os.makedirs(base_path, exist_ok=True)
+artifact_store = optuna.artifacts.FileSystemArtifactStore(base_path=base_path)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    value = (x - 2) ** 2
+    log_path = f'/tmp/optuna_artifacts/src_trial{trial.number}.txt'
+    with open(log_path, 'w') as f:
+        f.write(f'x={x}, value={value}\n')
+    artifact_id = optuna.artifacts.upload_artifact(
+        artifact_store=artifact_store,
+        file_path=log_path,
+        study_or_trial=trial,
+    )
+    trial.set_user_attr('artifact_id', artifact_id)
+    os.remove(log_path)
+    return value
+
+study = optuna.create_study(
+    study_name='artifact-demo',
+    storage='sqlite:////tmp/optuna_artifacts/artifact_demo.db',
+    sampler=optuna.samplers.TPESampler(seed=0),
+)
+study.optimize(objective, n_trials=3)
+print('best_trial number:', study.best_trial.number)
+print('best_trial artifact_id:', study.best_trial.user_attrs['artifact_id'])
+```
+実行結果:
+```
+best_trial number: 2
+best_trial artifact_id: 9d1c9f07-c737-4e09-b47b-2aab2b4dcbd3
+```
+
+**注意点・落とし穴**:
+- `upload_artifact`は元ファイルをストアにコピーするだけで、元の`file_path`は自動削除されない(本例のように呼び出し側で後片付けする必要がある)。
+- `upload_artifact`は戻り値として一意な`artifact_id`(文字列)を返すだけで、Trialへの紐付けは自動的には行われない。本例のように`trial.set_user_attr('artifact_id', artifact_id)`などで自分で紐付け情報を保存しておく必要がある。
+- 以降の例では`sqlite:///`で永続化した同じStudy(`artifact-demo`)を`load_study`で読み込み直して使う(「8. 永続化」の要領)。
+
+### `optuna.artifacts.download_artifact(...)`
+
+**用途**: `upload_artifact`で保存した`artifact_id`から、実体のファイルをローカルに取り出す。
+
+**シグネチャ**: `optuna.artifacts.download_artifact(*, artifact_store: ArtifactStore, file_path: str, artifact_id: str) -> None`
+
+**使用例**:
+```python
+import optuna
+
+storage_url = 'sqlite:////tmp/optuna_artifacts/artifact_demo.db'
+study = optuna.load_study(study_name='artifact-demo', storage=storage_url)
+best_artifact_id = study.best_trial.user_attrs['artifact_id']
+
+artifact_store = optuna.artifacts.FileSystemArtifactStore(base_path='/tmp/optuna_artifacts/store')
+download_path = '/tmp/optuna_artifacts/downloaded.txt'
+optuna.artifacts.download_artifact(
+    artifact_store=artifact_store,
+    file_path=download_path,
+    artifact_id=best_artifact_id,
+)
+with open(download_path) as f:
+    print('downloaded content:', f.read().strip())
+```
+実行結果:
+```
+downloaded content: x=2.055267521432878, value=0.0030544989253336228
+```
+
+**注意点・落とし穴**:
+- `file_path`は保存先のパスであり、`download_artifact`は指定したパスに新規ファイルを書き出す(既存ファイルがあれば上書きされる)。
+- 別プロセス(本例では別スクリプト実行)から`load_study`でStudyを読み込んでも、`user_attrs`に保存しておいた`artifact_id`経由でartifactを正しく取り出せることが確認できる(RDBStorageで永続化しているため)。
+
+### `optuna.artifacts.get_all_artifact_meta(...)`
+
+**用途**: 特定のTrial(またはStudy全体)に紐づいている全Artifactのメタ情報(ファイル名・サイズなど)を一覧取得する。
+
+**シグネチャ**: `optuna.artifacts.get_all_artifact_meta(study_or_trial: Trial | FrozenTrial | Study, *, storage: BaseStorage | None = None) -> list[ArtifactMeta]`
+
+**使用例**:
+```python
+import optuna
+
+storage_url = 'sqlite:////tmp/optuna_artifacts/artifact_demo.db'
+study = optuna.load_study(study_name='artifact-demo', storage=storage_url)
+
+# study.best_trial は storage への参照を持たない FrozenTrial なので、
+# get_all_artifact_meta には storage を明示的に渡す必要がある
+meta_list = optuna.artifacts.get_all_artifact_meta(study.best_trial, storage=study._storage)
+print('artifact count:', len(meta_list))
+print('filename:', meta_list[0].filename)
+
+try:
+    optuna.artifacts.get_all_artifact_meta(study.best_trial)
+except ValueError as e:
+    print('storage省略時のエラー:', e)
+```
+実行結果:
+```
+artifact count: 1
+filename: src_trial2.txt
+storage省略時のエラー: storage is required for FrozenTrial.
+```
+
+**注意点・落とし穴**:
+- `study.best_trial`や`study.trials[i]`のように`Study`経由で取得した`FrozenTrial`は、ストレージへの参照を保持していない。そのまま`get_all_artifact_meta(trial)`を呼ぶと`ValueError: storage is required for FrozenTrial.`になる(実行して確認済み)ため、`storage=study._storage`のように明示的に渡す必要がある。`study._storage`は公開APIではない内部属性である点に注意(将来のバージョンで変わりうる)。
+
+---
+
+## 14. ウォームスタートの応用
+
+### `Study.enqueue_trial(..., skip_if_exists=True)`
+
+**用途**: 複数回`enqueue_trial`を呼ぶ際、既に(完了済み・キュー済みを問わず)同じパラメータの試行が存在すれば、重複してキューに積まないようにする。
+
+**シグネチャ**: `Study.enqueue_trial(self, params: dict[str, Any], user_attrs: dict[str, Any] | None = None, skip_if_exists: bool = False) -> None`
+
+**使用例**:
+```python
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    return (x - 2) ** 2
+
+study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=0))
+study.enqueue_trial({'x': 2.0})
+study.enqueue_trial({'x': 2.0}, skip_if_exists=True)  # 同一パラメータなので積まれない
+study.enqueue_trial({'x': 5.0})
+print('waiting trials before optimize:', len(study.get_trials(states=(optuna.trial.TrialState.WAITING,))))
+study.optimize(objective, n_trials=5)
+print('trial0 params:', study.trials[0].params)
+print('trial1 params:', study.trials[1].params)
+```
+実行結果:
+```
+waiting trials before optimize: 2
+trial0 params: {'x': 2.0}
+trial1 params: {'x': 5.0}
+```
+
+**注意点・落とし穴**:
+- `{'x': 2.0}`を2回`enqueue_trial`したが、2回目は`skip_if_exists=True`のため無視され、`WAITING`状態の試行は2件(`x=2.0`と`x=5.0`)のみになっている(実行して確認済み)。`skip_if_exists=False`(デフォルト)だと同じパラメータでも毎回キューに積まれ、同じ値の試行が重複して実行される。
+- 「既知の初期値を1回だけ必ず試したいが、何度もこのコードが呼ばれうる(ノートブックの再実行など)」場面で重複投入を防ぐのに有効。
+
+### 別Studyの上位試行を`add_trial`でウォームスタートに使う
+
+**用途**: 過去に実行した(別の)Studyの中から成績の良かった試行だけを選び、新しいStudyの初期知識として`add_trial`で投入してから最適化を続ける。「9. その他」の`add_trial`は手書きの1件だけだったが、実際の運用では既存Studyの実データをこのように再利用することが多い。
+
+**シグネチャ**: `Study.add_trial(self, trial: FrozenTrial) -> None`(`optuna.trial.create_trial(...)`で既存`FrozenTrial`のparams/distributions/valueから新しい`FrozenTrial`を組み立てて渡す)
+
+**使用例**:
+```python
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+def objective(trial):
+    x = trial.suggest_float('x', -10, 10)
+    y = trial.suggest_float('y', -10, 10)
+    return (x - 2) ** 2 + (y + 3) ** 2
+
+# 旧Study: 通常のランダム探索で少し回した結果
+old_study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=0))
+old_study.optimize(objective, n_trials=20)
+
+# 新Study: 旧Studyの上位5件をadd_trialでウォームスタートしてからTPEで最適化を続ける
+top5 = sorted(old_study.trials, key=lambda t: t.value)[:5]
+new_study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=0))
+for t in top5:
+    new_study.add_trial(
+        optuna.trial.create_trial(params=t.params, distributions=t.distributions, value=t.value)
+    )
+print('new_study n_trials after warm start:', len(new_study.trials))
+new_study.optimize(objective, n_trials=10)
+print('new_study n_trials after optimize:', len(new_study.trials))
+print('new_study best_value:', round(new_study.best_value, 4))
+```
+実行結果:
+```
+new_study n_trials after warm start: 5
+new_study n_trials after optimize: 15
+new_study best_value: 4.1155
+```
+
+**注意点・落とし穴**:
+- `enqueue_trial`との違いに注意: `enqueue_trial`は「パラメータだけ」を指定し、目的関数は改めて実行されて新しく`value`が計算される。一方`add_trial`(本例)は`value`も含めて丸ごと登録するため、目的関数を再実行せずに済む代わりに、目的関数の実装が変わった場合でも古い`value`がそのまま使われてしまう点に注意が必要。
+- サンプラーが履歴を使う手法(`TPESampler`など)であれば、ウォームスタートで投入した試行も次の提案の材料として使われる。

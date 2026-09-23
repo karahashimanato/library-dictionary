@@ -24,6 +24,13 @@ polars 1.44.1 で検証済み
 10. [欠損値処理](#欠損値処理)
 11. [ピボット・reshape](#ピボットreshape)
 12. [型変換・その他便利メソッド](#型変換その他便利メソッド)
+13. [応用・発展](#応用発展)
+    - [Lazy APIのストリーミング実行・プロファイリング](#lazy-apiのストリーミング実行プロファイリング)
+    - [struct/list dtype操作の応用](#structlist-dtype操作の応用)
+    - [高度なウィンドウ・rolling](#高度なウィンドウrolling)
+    - [カスタムUDF(map_batches/map_elementsのパフォーマンス注意)](#カスタムudfmap_batchesmap_elementsのパフォーマンス注意)
+    - [SQLコンテキスト(pl.SQLContext)](#sqlコンテキストplsqlcontext)
+    - [高度な結合(join_asof・join_where・semi/anti join)](#高度な結合join_asofjoin_wheresemianti-join)
 
 ---
 
@@ -1790,3 +1797,749 @@ shape: (4, 2)
 
 **注意点・落とし穴**:
 - pandasの`cumsum()`と異なりアンダースコア入りの`cum_sum`という名前(`cum_max`/`cum_min`/`cum_prod`も同様の命名規則)。
+
+---
+
+## 応用・発展
+
+ここから先は、pandasとの対比というより、polars自体がLazy API・大規模データ処理・SQL互換性のために持つ独自機能を扱う。基礎編と同様、すべて`/home/manaty/library-practicing/.venv/bin/python`(polars 1.44.1)で実行して確認済み。
+
+### Lazy APIのストリーミング実行・プロファイリング
+
+#### `lf.collect(engine="streaming")`
+
+**用途**: LazyFrameのクエリを新しいストリーミングエンジンで実行する。データをバッチ単位で処理するため、メモリに乗り切らない大規模データでもメモリ使用量を抑えて処理できる。
+
+**シグネチャ**: `LazyFrame.collect(self, *, type_coercion=True, predicate_pushdown=True, projection_pushdown=True, simplify_expression=True, slice_pushdown=True, comm_subplan_elim=True, comm_subexpr_elim=True, cluster_with_columns=True, collapse_joins=True, no_optimization=False, engine='auto', background=False, optimizations=<QueryOptFlags>, **_kwargs) -> DataFrame | InProcessQuery`(主要引数のみ抜粋。`engine`は`'auto'`/`'in-memory'`/`'streaming'`/`'gpu'`などを取る)
+
+**使用例**:
+```python
+import polars as pl
+
+pl.DataFrame({"team": ["A", "A", "B", "B"], "score": [10, 20, 30, 40]}).write_csv("/tmp/sample_lazy2.csv")
+lf = pl.scan_csv("/tmp/sample_lazy2.csv").filter(pl.col("score") > 15).group_by("team").agg(pl.col("score").sum())
+
+print(lf.collect())
+print(lf.collect(engine="streaming"))
+```
+実行結果:
+```
+shape: (2, 2)
+┌──────┬───────┐
+│ team ┆ score │
+│ ---  ┆ ---   │
+│ str  ┆ i64   │
+╞══════╪═══════╡
+│ A    ┆ 20    │
+│ B    ┆ 70    │
+└──────┴───────┘
+shape: (2, 2)
+┌──────┬───────┐
+│ team ┆ score │
+│ ---  ┆ ---   │
+│ str  ┆ i64   │
+╞══════╪═══════╡
+│ A    ┆ 20    │
+│ B    ┆ 70    │
+└──────┴───────┘
+```
+
+**注意点・落とし穴**:
+- 旧バージョンにあった`collect(streaming=True)`は非推奨で、polars 1.44.1では`engine='streaming'`を使う(`explain()`の`streaming`引数はまだ残っているが、`collect()`側は`engine`に統一されている)。
+- ストリーミングエンジンは全ての演算に対応しているわけではなく、非対応の演算が含まれる場合は自動的に`in-memory`エンジンにフォールバックする。
+- `group_by`の出力行順序は(`maintain_order=False`がデフォルトのため)エンジンや実行タイミングによって変わりうる。本例ではたまたま両エンジンとも`A, B`の順になったが、順序に依存したコードを書くべきではない。
+
+#### `lf.profile()`
+
+**用途**: LazyFrameの各実行ノードにかかった時間を計測する。`explain()`がクエリ「計画」を見るのに対し、`profile()`は実際に実行して計測した結果を返す。
+
+**シグネチャ**: `LazyFrame.profile(self, *, type_coercion=True, predicate_pushdown=True, projection_pushdown=True, simplify_expression=True, no_optimization=False, slice_pushdown=True, comm_subplan_elim=True, comm_subexpr_elim=True, cluster_with_columns=True, collapse_joins=True, show_plot=False, truncate_nodes=0, figsize=(18, 8), engine='auto', optimizations=<QueryOptFlags>, **_kwargs) -> tuple[DataFrame, DataFrame]`
+
+**使用例**:
+```python
+result, timings = lf.profile()
+print(result)
+print(timings)
+```
+実行結果:
+```
+shape: (2, 2)
+┌──────┬───────┐
+│ team ┆ score │
+│ ---  ┆ ---   │
+│ str  ┆ i64   │
+╞══════╪═══════╡
+│ A    ┆ 20    │
+│ B    ┆ 70    │
+└──────┴───────┘
+shape: (1, 3)
+┌──────────────┬───────┬─────┐
+│ node         ┆ start ┆ end │
+│ ---          ┆ ---   ┆ --- │
+│ str          ┆ u64   ┆ u64 │
+╞══════════════╪═══════╪═════╡
+│ optimization ┆ 0     ┆ 602 │
+└──────────────┴───────┴─────┘
+```
+
+**注意点・落とし穴**:
+- 戻り値は`(クエリ結果のDataFrame, 各ノードの所要時間を表すDataFrame)`のタプル。`explain()`と違い実際にクエリを実行するため相応のコストがかかる。
+- `timings`の`start`/`end`はマイクロ秒単位の相対時刻。ノード数が少ない単純なクエリでは`optimization`ノード1件だけのように、粒度が粗く見えることがある(実行確認済み)。実行のたびに実測時間(上の例の`602`)は変動するため、値そのものではなく「どのノードが相対的に重いか」を見るのに使う。
+- `result`の行順序(`group_by`の出力順)は`maintain_order=False`がデフォルトのため保証されない。実際に同じクエリを複数回実行すると`A, B`の順になったり`B, A`の順になったりすることを確認済み。
+
+#### `lf.sink_parquet(...)` / `lf.sink_csv(...)`
+
+**用途**: LazyFrameの実行結果をDataFrameとしてメモリに全展開せず、ファイルへ直接ストリーム書き出しする。巨大な結果をメモリに乗せずに保存したい場合に使う。
+
+**シグネチャ**: `LazyFrame.sink_parquet(self, path, *, compression='zstd', compression_level=None, statistics=True, row_group_size=None, data_page_size=None, maintain_order=True, ..., lazy=False, engine='auto', ...) -> LazyFrame | None` / `LazyFrame.sink_csv(self, path, *, include_bom=False, compression='uncompressed', include_header=True, separator=',', ..., lazy=False, engine='auto', ...) -> LazyFrame | None`
+
+**使用例**:
+```python
+lf2 = pl.scan_csv("/tmp/sample_lazy2.csv").filter(pl.col("score") > 15)
+ret = lf2.sink_parquet("/tmp/sink_out.parquet")
+print(ret)
+print(pl.read_parquet("/tmp/sink_out.parquet"))
+```
+実行結果:
+```
+None
+shape: (3, 2)
+┌──────┬───────┐
+│ team ┆ score │
+│ ---  ┆ ---   │
+│ str  ┆ i64   │
+╞══════╪═══════╡
+│ A    ┆ 20    │
+│ B    ┆ 30    │
+│ B    ┆ 40    │
+└──────┴───────┘
+```
+
+**注意点・落とし穴**:
+- デフォルト(`lazy=False`)では即座にファイルへ書き込みを実行して`None`を返す(`collect()`を呼ぶ必要はない)。`lazy=True`を指定すると書き込み自体を表す`LazyFrame`が返り、後で`.collect()`するまで実行されない。
+- `write_parquet`/`write_csv`(Eager API)は結果を一度DataFrameとして完成させてから書き出すのに対し、`sink_*`はストリーミングエンジンでファイルI/Oまで含めてパイプライン化される点が異なる。
+
+#### `pl.Config(...)` / `pl.thread_pool_size()`
+
+**用途**: 表示フォーマット(表示行数・列数・文字列の省略幅など)や並列実行のスレッド数といった、polarsのグローバルな実行環境設定を調整する。
+
+**シグネチャ**: `pl.Config(*, restore_defaults=False, apply_on_context_enter=False, **options) -> None`(`with pl.Config(...):`でコンテキストマネージャとしても使える)/ `pl.thread_pool_size() -> int`
+
+**使用例**:
+```python
+print(pl.thread_pool_size())
+
+df_cfg = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+with pl.Config(tbl_rows=2):
+    print(df_cfg)
+print(df_cfg)
+```
+実行結果:
+```
+16
+shape: (5, 1)
+┌─────┐
+│ a   │
+│ --- │
+│ i64 │
+╞═════╡
+│ 1   │
+│ …   │
+│ 5   │
+└─────┘
+shape: (5, 1)
+┌─────┐
+│ a   │
+│ --- │
+│ i64 │
+╞═════╡
+│ 1   │
+│ 2   │
+│ 3   │
+│ 4   │
+│ 5   │
+└─────┘
+```
+
+**注意点・落とし穴**:
+- `pl.thread_pool_size()`の値(この検証環境では16)は実行マシンのCPUコア数などに依存し、環境によって変わる。スレッド数自体を変更したい場合は環境変数`POLARS_MAX_THREADS`をpolarsをインポートする前に設定する必要がある(インポート後の変更は反映されない)。
+- `pl.Config`は`with`ブロックを抜けると設定が自動的に元に戻る(上の例で`tbl_rows=2`の効果が2回目の`print`には残っていない)。`with`を使わず`pl.Config.set_tbl_rows(2)`のようにクラスメソッドで呼ぶと、明示的に`pl.Config.restore_defaults()`するまで設定が残り続ける。
+
+---
+
+### struct/list dtype操作の応用
+
+#### `Expr.list.eval(...)`
+
+**用途**: リスト型の列の各要素(内側のリスト)に対して、`pl.element()`を起点とする式を適用する。`map_elements`のようにPython関数を呼ぶのではなく、polarsのネイティブ式で完結するため高速。
+
+**シグネチャ**: `Expr.list.eval(self, expr, *, parallel=False) -> Expr`
+
+**使用例**:
+```python
+df_le = pl.DataFrame({"scores": [[1, 5, 3], [9, 2, 8, 1]]})
+print(df_le.with_columns(pl.col("scores").list.eval(pl.element() * 2).alias("doubled")))
+```
+実行結果:
+```
+shape: (2, 2)
+┌─────────────┬──────────────┐
+│ scores      ┆ doubled      │
+│ ---         ┆ ---          │
+│ list[i64]   ┆ list[i64]    │
+╞═════════════╪══════════════╡
+│ [1, 5, 3]   ┆ [2, 10, 6]   │
+│ [9, 2, … 1] ┆ [18, 4, … 2] │
+└─────────────┴──────────────┘
+```
+
+**注意点・落とし穴**:
+- `pl.element()`はリストの「1つの要素」ではなく、リスト内の値全体を表す式の起点(`.rank()`や`.max()`のような集約も可能)。単純な四則演算だけなら`.list.eval()`を使わずとも後述の`list`名前空間の個別メソッド(`list.sort()`など)で足りることも多い。
+
+#### `Expr.list.to_struct(...)` / `df.unnest(...)`
+
+**用途**: 固定長のリスト列をフィールド名付きのstruct列に変換し(`list.to_struct`)、structを個別の列に展開する(`unnest`)。CSVなどでは表現しづらい「1セルに複数値」を通常の列構造に戻す定石。
+
+**シグネチャ**: `Expr.list.to_struct(self, n_field_strategy=None, fields=None, upper_bound=None) -> Expr` / `DataFrame.unnest(self, columns=None, *more_columns, separator=None) -> DataFrame`
+
+**使用例**:
+```python
+df_l2s = pl.DataFrame({"items": [["a", "b"], ["c", "d"]]})
+out = df_l2s.with_columns(pl.col("items").list.to_struct(fields=["first", "second"]).alias("s"))
+print(out)
+print(out.unnest("s"))
+```
+実行結果:
+```
+shape: (2, 2)
+┌────────────┬───────────┐
+│ items      ┆ s         │
+│ ---        ┆ ---       │
+│ list[str]  ┆ struct[2] │
+╞════════════╪═══════════╡
+│ ["a", "b"] ┆ {"a","b"} │
+│ ["c", "d"] ┆ {"c","d"} │
+└────────────┴───────────┘
+shape: (2, 3)
+┌────────────┬───────┬────────┐
+│ items      ┆ first ┆ second │
+│ ---        ┆ ---   ┆ ---    │
+│ list[str]  ┆ str   ┆ str    │
+╞════════════╪═══════╪════════╡
+│ ["a", "b"] ┆ a     ┆ b      │
+│ ["c", "d"] ┆ c     ┆ d      │
+└────────────┴───────┴────────┘
+```
+
+**注意点・落とし穴**:
+- `fields`を省略する(`n_field_strategy`のデフォルト)と、先頭行のリスト長からフィールド数を推測し`field_0`, `field_1`, ...という名前が自動で振られる。リストの長さが行によって異なる場合、短い行の余ったフィールドは`null`になる。
+- `unnest()`はstruct型の列を展開して元のDataFrameの列に混ぜ込む。struct列自体は`unnest`後には残らない(置き換えられる)。
+
+#### `Expr.struct.rename_fields(...)`
+
+**用途**: struct列内のフィールド名を変更する。`pl.struct()`で作った直後のフィールド名(元の列名がそのまま使われる)を、用途に応じて付け替えたいときに使う。
+
+**シグネチャ**: `Expr.struct.rename_fields(self, names) -> Expr`
+
+**使用例**:
+```python
+df_srf = pl.DataFrame({"a": [1, 2], "b": [3, 4]}).with_columns(pl.struct(["a", "b"]).alias("s"))
+print(df_srf.with_columns(pl.col("s").struct.rename_fields(["x", "y"]).alias("s2")).select("s2").unnest("s2"))
+```
+実行結果:
+```
+shape: (2, 2)
+┌─────┬─────┐
+│ x   ┆ y   │
+│ --- ┆ --- │
+│ i64 ┆ i64 │
+╞═════╪═════╡
+│ 1   ┆ 3   │
+│ 2   ┆ 4   │
+└─────┴─────┘
+```
+
+**注意点・落とし穴**:
+- `names`は位置で元のフィールドに対応する(名前で紐付けるわけではない)。元のフィールド数と`names`の長さが一致している必要がある。
+
+#### `Expr.list.sort(...)` / `Expr.list.join(...)` / `Expr.list.contains(...)`
+
+**用途**: リスト列そのものを扱う便利メソッド群。それぞれリスト内部の要素をソートする/文字列リストを区切り文字で1本の文字列に連結する/特定の値を含むか判定する。
+
+**シグネチャ**: `Expr.list.sort(self, *, descending=False, nulls_last=False) -> Expr` / `Expr.list.join(self, separator, *, ignore_nulls=True) -> Expr` / `Expr.list.contains(self, item, *, nulls_equal=True) -> Expr`
+
+**使用例**:
+```python
+df_lst = pl.DataFrame({"items": [[3, 1, 2], [9, 7]]})
+print(df_lst.with_columns(
+    pl.col("items").list.sort().alias("sorted"),
+    pl.col("items").list.contains(7).alias("has7"),
+))
+
+df_words = pl.DataFrame({"words": [["a", "b", "c"], ["x", "y"]]})
+print(df_words.with_columns(pl.col("words").list.join("-").alias("joined")))
+```
+実行結果:
+```
+shape: (2, 3)
+┌───────────┬───────────┬───────┐
+│ items     ┆ sorted    ┆ has7  │
+│ ---       ┆ ---       ┆ ---   │
+│ list[i64] ┆ list[i64] ┆ bool  │
+╞═══════════╪═══════════╪═══════╡
+│ [3, 1, 2] ┆ [1, 2, 3] ┆ false │
+│ [9, 7]    ┆ [7, 9]    ┆ true  │
+└───────────┴───────────┴───────┘
+shape: (2, 2)
+┌─────────────────┬────────┐
+│ words           ┆ joined │
+│ ---             ┆ ---    │
+│ list[str]       ┆ str    │
+╞═════════════════╪════════╡
+│ ["a", "b", "c"] ┆ a-b-c  │
+│ ["x", "y"]      ┆ x-y    │
+└─────────────────┴────────┘
+```
+
+**注意点・落とし穴**:
+- `list.join()`は文字列のリストにのみ使える(数値リストは事前に`.cast(pl.List(pl.String))`などで文字列化する必要がある)。区切り文字を列(式)で指定することもできる。
+
+---
+
+### 高度なウィンドウ・rolling
+
+#### `Expr.rolling_mean_by(...)`
+
+**用途**: 行数ベースではなく、時刻列の値そのもの(例: 過去3日間)を基準にした移動平均を計算する。`group_by_dynamic`が「時刻でバケット化して集計」するのに対し、こちらは各行ごとに「その時刻から遡った窓」の集計値を、元の行数のまま返す。
+
+**シグネチャ**: `Expr.rolling_mean_by(self, by, window_size, *, min_samples=1, closed='right') -> Expr`
+
+**使用例**:
+```python
+df_rmb = pl.DataFrame({
+    "t": pl.datetime_range(pl.datetime(2024, 1, 1), pl.datetime(2024, 1, 6), "1d", eager=True),
+    "v": [1, 2, 3, 4, 5, 6],
+})
+print(df_rmb.with_columns(pl.col("v").rolling_mean_by("t", window_size="3d").alias("roll_mean_3d")))
+```
+実行結果:
+```
+shape: (6, 3)
+┌─────────────────────┬─────┬──────────────┐
+│ t                   ┆ v   ┆ roll_mean_3d │
+│ ---                 ┆ --- ┆ ---          │
+│ datetime[μs]        ┆ i64 ┆ f64          │
+╞═════════════════════╪═════╪══════════════╡
+│ 2024-01-01 00:00:00 ┆ 1   ┆ 1.0          │
+│ 2024-01-02 00:00:00 ┆ 2   ┆ 1.5          │
+│ 2024-01-03 00:00:00 ┆ 3   ┆ 2.0          │
+│ 2024-01-04 00:00:00 ┆ 4   ┆ 3.0          │
+│ 2024-01-05 00:00:00 ┆ 5   ┆ 4.0          │
+│ 2024-01-06 00:00:00 ┆ 6   ┆ 5.0          │
+└─────────────────────┴─────┴──────────────┘
+```
+
+**注意点・落とし穴**:
+- `by`列は昇順にソート済みである必要がある(`group_by_dynamic`の`index_column`と同じ制約)。
+- デフォルト`closed='right'`は「窓の右端(現在行の時刻)を含み、`window_size`だけ遡った範囲(左端は含まない)」を意味する。`group_by_dynamic`のデフォルトが`closed='left'`なのと非対称なので混同しやすい。
+
+#### `Expr.rolling_map(...)`
+
+**用途**: 移動窓に対して、`sum`/`mean`のような組み込み集計では表現できない任意のPython関数を適用する(`map_elements`の移動窓版)。
+
+**シグネチャ**: `Expr.rolling_map(self, function, window_size, weights=None, *, min_samples=None, center=False) -> Expr`
+
+**使用例**:
+```python
+df_rmap = pl.DataFrame({"v": [1, 2, 3, 4, 5]})
+print(df_rmap.with_columns(
+    pl.col("v").rolling_map(lambda s: s.max() - s.min(), window_size=3).alias("range3")
+))
+```
+実行結果:
+```
+shape: (5, 2)
+┌─────┬────────┐
+│ v   ┆ range3 │
+│ --- ┆ ---    │
+│ i64 ┆ i64    │
+╞═════╪════════╡
+│ 1   ┆ null   │
+│ 2   ┆ null   │
+│ 3   ┆ 2      │
+│ 4   ┆ 2      │
+│ 5   ┆ 2      │
+└─────┴────────┘
+```
+
+**注意点・落とし穴**:
+- `function`は窓に含まれる値を`pl.Series`として受け取り、スカラーを返す必要がある。`map_elements`と同様にPythonコールバックを呼ぶため、`rolling_mean`などの組み込みメソッドで代替できないか先に検討すべき(遅い)。
+- 窓が満たない先頭部分は`null`になる(`rolling_mean`などと同じ挙動)。
+
+#### `Expr.cum_count(...)`
+
+**用途**: 各行までの累積件数(1始まりの連番、`null`は数えない)を計算する。
+
+**シグネチャ**: `Expr.cum_count(self, *, reverse=False) -> Expr`
+
+**使用例**:
+```python
+df_cc = pl.DataFrame({"v": [10, 20, 30]})
+print(df_cc.with_columns(pl.col("v").cum_count().alias("cum_n")))
+```
+実行結果:
+```
+shape: (3, 2)
+┌─────┬───────┐
+│ v   ┆ cum_n │
+│ --- ┆ ---   │
+│ i64 ┆ u32   │
+╞═════╪═══════╡
+│ 10  ┆ 1     │
+│ 20  ┆ 2     │
+│ 30  ┆ 3     │
+└─────┴───────┘
+```
+
+**注意点・落とし穴**:
+- `with_row_index()`が単なる連番の列を追加するのに対し、`cum_count()`は`null`値をスキップしてカウントする点が異なる(欠損を含む列で「有効値の累積個数」を数えたいときに使う)。
+
+#### `Expr.over(order_by=..., mapping_strategy=...)`
+
+**用途**: 基礎編で扱った`Expr.over()`をさらに応用し、`order_by`でグループ内の計算順序を明示したり、`mapping_strategy="join"`で集計結果を1行にまとめたリストとして返したりする。
+
+**シグネチャ**: `Expr.over(self, partition_by=None, *more_exprs, order_by=None, descending=False, nulls_last=False, mapping_strategy='group_to_rows') -> Expr`
+
+**使用例**:
+```python
+df_ov = pl.DataFrame({"team": ["A", "A", "B", "B"], "t": [3, 1, 2, 4], "score": [10, 20, 30, 40]})
+print(df_ov.with_columns(pl.col("score").cum_sum().over("team", order_by="t").alias("cum_by_t")))
+print(df_ov.with_columns(pl.col("score").over("team", mapping_strategy="join").alias("scores_in_team")))
+```
+実行結果:
+```
+shape: (4, 4)
+┌──────┬─────┬───────┬──────────┐
+│ team ┆ t   ┆ score ┆ cum_by_t │
+│ ---  ┆ --- ┆ ---   ┆ ---      │
+│ str  ┆ i64 ┆ i64   ┆ i64      │
+╞══════╪═════╪═══════╪══════════╡
+│ A    ┆ 3   ┆ 10    ┆ 30       │
+│ A    ┆ 1   ┆ 20    ┆ 20       │
+│ B    ┆ 2   ┆ 30    ┆ 30       │
+│ B    ┆ 4   ┆ 40    ┆ 70       │
+└──────┴─────┴───────┴──────────┘
+shape: (4, 4)
+┌──────┬─────┬───────┬────────────────┐
+│ team ┆ t   ┆ score ┆ scores_in_team │
+│ ---  ┆ --- ┆ ---   ┆ ---            │
+│ str  ┆ i64 ┆ i64   ┆ list[i64]      │
+╞══════╪═════╪═══════╪════════════════╡
+│ A    ┆ 3   ┆ 10    ┆ [10, 20]       │
+│ A    ┆ 1   ┆ 20    ┆ [10, 20]       │
+│ B    ┆ 2   ┆ 30    ┆ [30, 40]       │
+│ B    ┆ 4   ┆ 40    ┆ [30, 40]       │
+└──────┴─────┴───────┴────────────────┘
+```
+
+**注意点・落とし穴**:
+- `order_by`を指定しないと、`cum_sum`などの順序に依存する式は元のDataFrameの行順(この例では`t`列がバラバラな順)でグループ内計算されてしまう。時系列データで`over()`と累積系の式を組み合わせるときは`order_by`の指定を忘れないこと。
+- `mapping_strategy`のデフォルト`'group_to_rows'`は各行にグループの集計値1つを割り当てるが、`'join'`はグループ内の全値を`list`型にまとめて各行に埋め込む(行ごとに「自分のグループの全メンバー」を持たせたい場合に使う)。
+
+#### `df.rolling(...)`
+
+**用途**: 時刻列を基準にした移動窓で`group_by`するための入口(`RollingGroupBy`)。`Expr.rolling_mean_by()`が式単体で完結するのに対し、`df.rolling()`は`group_by_dynamic`と同じく`.agg()`で複数の集計式をまとめて書ける。
+
+**シグネチャ**: `DataFrame.rolling(self, index_column, *, period, offset=None, closed='right', group_by=None) -> RollingGroupBy`
+
+**使用例**:
+```python
+df_roll2 = pl.DataFrame({
+    "t": pl.datetime_range(pl.datetime(2024, 1, 1), pl.datetime(2024, 1, 6), "1d", eager=True),
+    "v": [1, 2, 3, 4, 5, 6],
+})
+print(df_roll2.rolling(index_column="t", period="2d").agg(pl.col("v").sum().alias("v_sum_2d")))
+```
+実行結果:
+```
+shape: (6, 2)
+┌─────────────────────┬──────────┐
+│ t                   ┆ v_sum_2d │
+│ ---                 ┆ ---      │
+│ datetime[μs]        ┆ i64      │
+╞═════════════════════╪══════════╡
+│ 2024-01-01 00:00:00 ┆ 1        │
+│ 2024-01-02 00:00:00 ┆ 3        │
+│ 2024-01-03 00:00:00 ┆ 5        │
+│ 2024-01-04 00:00:00 ┆ 7        │
+│ 2024-01-05 00:00:00 ┆ 9        │
+│ 2024-01-06 00:00:00 ┆ 11       │
+└─────────────────────┴──────────┘
+```
+
+**注意点・落とし穴**:
+- `group_by_dynamic`が固定間隔(`every`)でウィンドウの起点を作るのに対し、`rolling()`は各行そのものを窓の右端(デフォルト`closed='right'`)として、そこから`period`分だけ遡る。そのため出力の行数は常に元のDataFrameと同じになる(`group_by_dynamic`は行数が変わりうる)。
+
+---
+
+### カスタムUDF(map_batches/map_elementsのパフォーマンス注意)
+
+#### `Expr.map_batches(...)`
+
+**用途**: Python関数を要素単位ではなく列(`Series`)単位で1回だけ呼び出す。`Series`全体の統計量(平均・標準偏差など)を使う処理や、NumPy/pandasなど他ライブラリのベクトル化関数をそのまま使いたい場合に向く。
+
+**シグネチャ**: `Expr.map_batches(self, function, return_dtype=None, *, agg_list=False, is_elementwise=False, returns_scalar=False) -> Expr`
+
+**使用例**:
+```python
+df_mb = pl.DataFrame({"v": [1.0, 2.0, 3.0, 4.0]})
+
+def zscore(s: pl.Series) -> pl.Series:
+    return (s - s.mean()) / s.std()
+
+print(df_mb.with_columns(pl.col("v").map_batches(zscore, is_elementwise=False).alias("z")))
+```
+実行結果:
+```
+shape: (4, 2)
+┌─────┬───────────┐
+│ v   ┆ z         │
+│ --- ┆ ---       │
+│ f64 ┆ f64       │
+╞═════╪═══════════╡
+│ 1.0 ┆ -1.161895 │
+│ 2.0 ┆ -0.387298 │
+│ 3.0 ┆ 0.387298  │
+│ 4.0 ┆ 1.161895  │
+└─────┴───────────┘
+```
+
+**注意点・落とし穴**:
+- `function`が受け取るのはスカラーではなく`pl.Series`そのもの(この例のように`s.mean()`など`Series`全体に対する集計が使える)。`map_elements`と混同しないこと。
+- `is_elementwise`(デフォルト`False`)は、公式ドキュメントいわく「入力に対して要素ごとに独立に(順不同のスライスに分割して実行しても結果が変わらない)処理である場合に`True`にすると最適化が効いて速くなる」引数。上の`zscore`例のように`Series`全体の統計量に依存する関数を誤って`is_elementwise=True`にすると、`group_by`後の集計などクエリオプティマイザがスライス分割・並列化する文脈で誤った結果になりうるため、要素ごとに完結する処理でない限り`False`のままにしておくのが安全。
+
+#### パフォーマンス比較: `map_elements` vs `map_batches`
+
+**用途**: 同じ「各値を2倍にする」処理を`map_elements`(要素ごとにPython関数を呼ぶ)と`map_batches`(列全体に対してベクトル化関数を1回呼ぶ)で実装し、実測で速度差を確認する。
+
+**シグネチャ**: (ベンチマークのため両メソッドの再掲はしない。上記および基礎編の`Expr.map_elements(...)`を参照)
+
+**使用例**:
+```python
+import time
+
+n = 2_000_000
+df_bench = pl.DataFrame({"a": range(n)})
+
+t0 = time.perf_counter()
+df_bench.with_columns(pl.col("a").map_elements(lambda x: x * 2, return_dtype=pl.Int64).alias("r"))
+t_elem = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+df_bench.with_columns(pl.col("a").map_batches(lambda s: s * 2, is_elementwise=True).alias("r"))
+t_batch = time.perf_counter() - t0
+
+print(f"map_elements: {t_elem:.3f}s")
+print(f"map_batches:  {t_batch:.3f}s")
+```
+実行結果:
+```
+map_elements: 0.266s
+map_batches:  0.050s
+```
+
+**注意点・落とし穴**:
+- `map_elements`を実行すると`PolarsInefficientMapWarning`(「`Expr.map_elements`はネイティブ式APIより著しく遅い」という趣旨)が出る(実行確認済み。基礎編の該当箇所と同じ警告)。この検証(200万行、単純な`x * 2`)では`map_batches`が約5倍高速だった。ただし実際の速度差は処理内容・データ量に依存するため、この数値自体を一般的な倍率として鵜呑みにしないこと。
+- 最も速いのは`map_elements`/`map_batches`のどちらでもなく、可能な限り`pl.col("a") * 2`のようなネイティブ式で書くこと。両者はいずれも「ネイティブ式で書けない場合の最終手段」という位置づけ。
+- `map_elements`の`strategy`引数(デフォルト`'thread_local'`)を`'threading'`にすると別スレッドで並列実行できるが、公式ドキュメントに「Pythonの関数がGILを解放する(C拡張関数呼び出しなど)場合以外は効果が薄く、パフォーマンスが悪化しうる実験的機能」と明記されている(`help(pl.Expr.map_elements)`で確認済み)。
+
+---
+
+### SQLコンテキスト(pl.SQLContext)
+
+#### `pl.SQLContext(...)` / `SQLContext.execute(...)`
+
+**用途**: DataFrame/LazyFrameにSQLのテーブル名を割り当て、SQL文で問い合わせる。polarsの式APIに不慣れなメンバーとの共有や、既存のSQLロジックの移植に向く。
+
+**シグネチャ**: `pl.SQLContext(frames=None, *, register_globals=False, eager=False, **named_frames) -> None`(コンストラクタ)/ `SQLContext.execute(self, query, *, eager=None) -> LazyFrame | DataFrame`
+
+**使用例**:
+```python
+df_sql = pl.DataFrame({"team": ["A", "A", "B", "B"], "score": [10, 20, 30, 40]})
+ctx = pl.SQLContext(players=df_sql, eager=True)
+result = ctx.execute("SELECT team, SUM(score) AS total FROM players GROUP BY team ORDER BY team")
+print(result)
+```
+実行結果:
+```
+shape: (2, 2)
+┌──────┬───────┐
+│ team ┆ total │
+│ ---  ┆ ---   │
+│ str  ┆ i64   │
+╞══════╪═══════╡
+│ A    ┆ 30    │
+│ B    ┆ 70    │
+└──────┴───────┘
+```
+
+**注意点・落とし穴**:
+- コンストラクタの`eager=True`(またはコンストラクタでは指定せず`execute(eager=True)`)を指定しないと、`execute()`はDataFrameではなく未評価の`LazyFrame`を返す。標準ではLazyに倒す設計になっている。
+- サポートされるSQL構文はpolarsが実装している範囲に限られ、DuckDBやPostgreSQLなど汎用RDBMSのSQL方言と完全互換ではない。
+
+#### `with pl.SQLContext(...) as ctx:` / `ctx.tables()`
+
+**用途**: 複数のDataFrameを一括登録してSQLのJOINを行い、登録済みテーブル名の一覧を確認する。`with`文で使うとブロックを抜けた際にコンテキストが後始末される。
+
+**シグネチャ**: `SQLContext.tables(self) -> list[str]`
+
+**使用例**:
+```python
+df_t1 = pl.DataFrame({"id": [1, 2], "name": ["x", "y"]})
+df_t2 = pl.DataFrame({"id": [1, 2], "val": [10, 20]})
+with pl.SQLContext(t1=df_t1, t2=df_t2, eager=True) as ctx:
+    result = ctx.execute("SELECT t1.name, t2.val FROM t1 JOIN t2 ON t1.id = t2.id")
+    print(result)
+    print(ctx.tables())
+```
+実行結果:
+```
+shape: (2, 2)
+┌──────┬─────┐
+│ name ┆ val │
+│ ---  ┆ --- │
+│ str  ┆ i64 │
+╞══════╪═════╡
+│ x    ┆ 10  │
+│ y    ┆ 20  │
+└──────┴─────┘
+['t1', 't2']
+```
+
+**注意点・落とし穴**:
+- 複数フレームはコンストラクタのキーワード引数(`t1=df_t1, t2=df_t2, ...`)としてまとめて登録でき、そのキーワード名がSQL上のテーブル名になる。個別に追加したい場合は`ctx.register(name, frame)`を使う。
+
+---
+
+### 高度な結合(join_asof・join_where・semi/anti join)
+
+#### `df.join_asof(...)`
+
+**用途**: 完全一致ではなく「直近の値」で結合する(例: 取引時刻に対して直近の気配値を紐付ける、時系列データ特有の結合)。SQLの`ASOF JOIN`に相当。
+
+**シグネチャ**: `df.join_asof(other, *, left_on=None, right_on=None, on=None, by_left=None, by_right=None, by=None, strategy='backward', suffix='_right', tolerance=None, allow_parallel=True, force_parallel=False, coalesce=True, allow_exact_matches=True, check_sortedness=True) -> DataFrame`
+
+**使用例**:
+```python
+trades = pl.DataFrame({"t": [1, 3, 6, 9], "price": [100, 101, 103, 105]}).sort("t")
+quotes = pl.DataFrame({"t": [0, 2, 4, 8], "quote": ["q0", "q2", "q4", "q8"]}).sort("t")
+print(trades.join_asof(quotes, on="t", strategy="backward"))
+```
+実行結果:
+```
+shape: (4, 3)
+┌─────┬───────┬───────┐
+│ t   ┆ price ┆ quote │
+│ --- ┆ ---   ┆ ---   │
+│ i64 ┆ i64   ┆ str   │
+╞═════╪═══════╪═══════╡
+│ 1   ┆ 100   ┆ q0    │
+│ 3   ┆ 101   ┆ q2    │
+│ 6   ┆ 103   ┆ q4    │
+│ 9   ┆ 105   ┆ q8    │
+└─────┴───────┴───────┘
+```
+
+**注意点・落とし穴**:
+- 両方のDataFrameが結合キー(`on`)で事前にソートされている必要がある(`check_sortedness=True`がデフォルトで、未ソートだと例外になる)。
+- `strategy='backward'`(デフォルト)は「自分以下で最も近い」値に結合する。`'forward'`(自分以上で最も近い)、`'nearest'`(前後どちらでも最も近い)も選べる。
+- `by`引数でグループごとの`asof`結合(例: 銘柄ごとに直近の気配値を引く)もできる。
+
+#### `df.join_where(...)`
+
+**用途**: 等価結合(`on`列が一致)ではなく、任意の不等号を含む条件式(例: 値が範囲内に収まるか)で結合する。SQLの`JOIN ... ON`に任意条件を書けるのと同じ発想(いわゆるtheta結合)。
+
+**シグネチャ**: `df.join_where(other, *predicates, how='inner', suffix='_right') -> DataFrame`
+
+**使用例**:
+```python
+df_left = pl.DataFrame({"id": [1, 2, 3], "lo": [0, 10, 20], "hi": [9, 19, 29]})
+df_right = pl.DataFrame({"id2": [1, 2], "val": [5, 15]})
+print(df_left.join_where(df_right, pl.col("val") >= pl.col("lo"), pl.col("val") <= pl.col("hi")))
+```
+実行結果:
+```
+shape: (2, 5)
+┌─────┬─────┬─────┬─────┬─────┐
+│ id  ┆ lo  ┆ hi  ┆ id2 ┆ val │
+│ --- ┆ --- ┆ --- ┆ --- ┆ --- │
+│ i64 ┆ i64 ┆ i64 ┆ i64 ┆ i64 │
+╞═════╪═════╪═════╪═════╪═════╡
+│ 2   ┆ 10  ┆ 19  ┆ 2   ┆ 15  │
+│ 1   ┆ 0   ┆ 9   ┆ 1   ┆ 5   │
+└─────┴─────┴─────┴─────┴─────┘
+```
+
+**注意点・落とし穴**:
+- `on`ではなく複数の述語(`Expr`)を可変長引数で渡す(通常の`join`とは呼び出し方が異なる)。等価条件しか使わないなら通常の`join`の方が最適化が効きやすく高速。
+- `how`に指定できるのは`'inner'`/`'left'`/`'right'`のみで、通常の`join`にある`'full'`/`'semi'`/`'anti'`は`join_where`では使えない(型定義`JoinWhereStrategy`で確認済み)。
+
+#### `df.join(..., how="semi")` / `df.join(..., how="anti")`
+
+**用途**: 相手側の値を列として持ち込まず、「相手に一致する行だけを残す(semi)」「相手に一致しない行だけを残す(anti)」というフィルタ的な結合を行う。SQLの`WHERE EXISTS`/`WHERE NOT EXISTS`に相当。
+
+**シグネチャ**: `df.join(other, on=None, how='inner', ...)`(`how`に`'semi'`/`'anti'`を指定。基礎編の`df.join(...)`と同一メソッド)
+
+**使用例**:
+```python
+df_left2 = pl.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+df_right2 = pl.DataFrame({"id": [2, 3, 4]})
+print(df_left2.join(df_right2, on="id", how="semi"))
+print(df_left2.join(df_right2, on="id", how="anti"))
+```
+実行結果:
+```
+shape: (2, 2)
+┌─────┬──────┐
+│ id  ┆ name │
+│ --- ┆ ---  │
+│ i64 ┆ str  │
+╞═════╪══════╡
+│ 2   ┆ b    │
+│ 3   ┆ c    │
+└─────┴──────┘
+shape: (1, 2)
+┌─────┬──────┐
+│ id  ┆ name │
+│ --- ┆ ---  │
+│ i64 ┆ str  │
+╞═════╪══════╡
+│ 1   ┆ a    │
+└─────┴──────┘
+```
+
+**注意点・落とし穴**:
+- `how='inner'`と`on`列だけを指定してから不要列を`drop`するのと違い、`semi`/`anti`は右側のDataFrameの列を一切結果に含めない(行のフィルタとしてのみ機能する)。右側に重複キーがあっても行が増殖しない点も通常の`inner`結合と異なる。
+
+#### `df.join(..., validate=...)`
+
+**用途**: 結合キーの重複関係(1:1・1:多・多:1・多:多)を事前に宣言し、想定と異なる場合に例外を出して早期に気付けるようにする。
+
+**シグネチャ**: `df.join(other, on=None, how='inner', *, ..., validate='m:m', ...)`(`validate`は`'1:1'`/`'1:m'`/`'m:1'`/`'m:m'`のいずれか。デフォルトは検証なしの`'m:m'`)
+
+**使用例**:
+```python
+df_left3 = pl.DataFrame({"id": [1, 1, 2], "name": ["a", "a2", "b"]})
+df_right3 = pl.DataFrame({"id": [1, 2], "val": [100, 200]})
+try:
+    df_left3.join(df_right3, on="id", validate="1:1")
+except Exception as e:
+    print(type(e).__name__, e)
+```
+実行結果:
+```
+ComputeError join keys did not fulfill 1:1 validation
+```
+
+**注意点・落とし穴**:
+- `validate`はキーの一意性を事前に検査するコストがかかる分、意図しない多重結合(結合後に行数が想定外に増えるバグ)を早期発見できる。デフォルトの`'m:m'`は検証を行わない(=何でも許容する)ので、想定される関係が分かっている場合は明示的に指定した方が安全。

@@ -11,6 +11,7 @@ imbalanced-learn 0.14.2 で検証済み。すべてのシグネチャ・実行�
 5. [アンサンブル学習](#5-アンサンブル学習)
 6. [評価指標](#6-評価指標)
 7. [その他ユーティリティ](#7-その他ユーティリティ)
+8. [応用・発展](#8-応用発展)
 
 ---
 
@@ -786,4 +787,423 @@ before: (300, 3) after: (295, 3)
 **注意点・落とし穴**:
 - `func=None`(デフォルト)の場合、何もしない恒等サンプラーになる。
 - scikit-learn本体の`FunctionTransformer`と異なり、戻り値でXとyのサンプル数(行数)を変えることが明示的に許可されている点が本質的な違い(`FunctionTransformer`はサンプル数を変えない変換を想定している)。これにより外れ値除去のような処理も`Pipeline`のステップとして組み込める。
+
+---
+
+## 8. 応用・発展
+
+**8-1. カスタムサンプラーの自作**
+
+### `imblearn.base.BaseSampler`
+
+**用途**: 既存のSMOTE系・アンダーサンプリング系にない独自のリサンプリングロジックを、`fit_resample`を持つ「サンプラー」として自作し、`imblearn.pipeline.Pipeline`(4節)に組み込めるようにするための最も基底となるクラス。
+
+**シグネチャ**: `imblearn.base.BaseSampler(sampling_strategy='auto')`
+
+**使用例**:
+```python
+from sklearn.datasets import make_classification
+from imblearn.base import BaseSampler
+
+X, y = make_classification(
+    n_samples=1000, n_features=5, n_informative=3, n_redundant=0,
+    n_clusters_per_class=1, weights=[0.9, 0.1], flip_y=0, random_state=0,
+)
+
+class Bad(BaseSampler):
+    _sampling_type = "under-sampling"
+    def _fit_resample(self, X, y):
+        return X, y
+
+try:
+    Bad().fit_resample(X, y)
+except AttributeError as e:
+    print("AttributeError:", e)
+```
+実行結果:
+```
+AttributeError: 'Bad' object has no attribute '_parameter_constraints'
+```
+
+**注意点・落とし穴**:
+- `BaseSampler`は`_sampling_type`クラス属性(`'under-sampling'`/`'over-sampling'`/`'clean-sampling'`)と`_fit_resample(self, X, y)`の実装を要求するが、それだけでは不十分で、`_parameter_constraints`(sklearnのパラメータ検証機構が参照する辞書)を自分で定義していないと`fit_resample`実行時に上記の`AttributeError`になる(検証済み)。
+- 実務で自作サンプラーを書く場合は`BaseSampler`を直接継承するより、次項の`BaseUnderSampler`のように既に`_parameter_constraints`と`_sampling_type`が用意されているサブクラスを継承する方が簡単で安全。単純な関数をラップするだけなら7節の`FunctionSampler`の方が手軽。
+
+### `imblearn.under_sampling.base.BaseUnderSampler`
+
+**用途**: 独自のアンダーサンプリングアルゴリズムを実装する際の実用的な継承先。`_sampling_type = "under-sampling"`と、`sampling_strategy`の型チェック用`_parameter_constraints`があらかじめ定義されているため、`_fit_resample`を実装するだけで動くサンプラーが作れる。
+
+**シグネチャ**: `imblearn.under_sampling.base.BaseUnderSampler(sampling_strategy='auto')`(継承先で`_fit_resample(self, X, y)`を実装する)
+
+**使用例**:
+```python
+import numpy as np
+from collections import Counter
+from sklearn.datasets import make_classification
+from imblearn.under_sampling.base import BaseUnderSampler
+
+X, y = make_classification(
+    n_samples=1000, n_features=5, n_informative=3, n_redundant=0,
+    n_clusters_per_class=1, weights=[0.9, 0.1], flip_y=0, random_state=0,
+)
+
+class EveryOtherMajoritySampler(BaseUnderSampler):
+    """多数派クラスのサンプルを1つおきに間引く自作アンダーサンプラー(デモ用)。"""
+    def _fit_resample(self, X, y):
+        classes = np.unique(y)
+        majority_class = max(classes, key=lambda c: np.sum(y == c))
+        keep_mask = np.ones(len(y), dtype=bool)
+        majority_idx = np.flatnonzero(y == majority_class)
+        keep_mask[majority_idx[1::2]] = False  # 多数派を1つおきに除去
+        return X[keep_mask], y[keep_mask]
+
+sampler = EveryOtherMajoritySampler()
+Xr, yr = sampler.fit_resample(X, y)
+print(Xr.shape, Counter(yr))
+print(sampler.sampling_strategy_)
+```
+実行結果:
+```
+(550, 5) Counter({np.int64(0): 450, np.int64(1): 100})
+OrderedDict({np.int64(0): np.int64(100)})
+```
+
+**注意点・落とし穴**:
+- `_fit_resample`は検証・numpy配列化済みの`X`, `y`を受け取り、`(X_resampled, y_resampled)`を返すだけでよい。`fit_resample`実行後に自動でセットされる`self.sampling_strategy_`属性(クラスごとの「追加/削除すべき件数」の辞書、8-2節の`check_sampling_strategy`参照)を`_fit_resample`内で使えば、`sampling_strategy`引数を尊重したロジックも書ける。
+- 同様にオーバーサンプリング系は`imblearn.over_sampling.base.BaseOverSampler`(`_sampling_type="over-sampling"`)、クリーニング系(`TomekLinks`等)は`imblearn.under_sampling.base.BaseCleaningSampler`(`_sampling_type="clean-sampling"`)を継承するのが定石。
+
+**8-2. 多クラス不均衡・sampling_strategy の指定**
+
+### `SMOTE(sampling_strategy={...})`(多クラスでのdict指定)
+
+**用途**: 3クラス以上の多クラス不均衡データに対して、`sampling_strategy`にdictを渡し、クラスごとに目標件数(最終的な件数)を個別指定する。1節では2値分類のみを扱ったが、SMOTE系・アンダーサンプリング系のほとんどが多クラスにもそのまま対応している。
+
+**シグネチャ**: `imblearn.over_sampling.SMOTE(*, sampling_strategy='auto', random_state=None, k_neighbors=5)`
+
+**使用例**:
+```python
+from collections import Counter
+from sklearn.datasets import make_classification
+from imblearn.over_sampling import SMOTE
+
+X3, y3 = make_classification(
+    n_samples=1000, n_features=5, n_informative=3, n_redundant=0,
+    n_clusters_per_class=1, n_classes=3, weights=[0.7, 0.2, 0.1], flip_y=0, random_state=0,
+)
+print("before:", Counter(y3))
+
+sm_dict = SMOTE(sampling_strategy={0: 700, 1: 300, 2: 300}, random_state=0)
+_, yr = sm_dict.fit_resample(X3, y3)
+print("after dict:", Counter(yr))
+
+sm_auto = SMOTE(random_state=0)
+_, ya = sm_auto.fit_resample(X3, y3)
+print("after auto:", Counter(ya))
+```
+実行結果:
+```
+before: Counter({np.int64(0): 700, np.int64(1): 200, np.int64(2): 100})
+after dict: Counter({np.int64(0): 700, np.int64(1): 300, np.int64(2): 300})
+after auto: Counter({np.int64(0): 700, np.int64(1): 700, np.int64(2): 700})
+```
+
+**注意点・落とし穴**:
+- `sampling_strategy`にdictを渡す場合、値は「そのクラスの最終的な目標件数」であり、元の件数以上でなければならない(オーバーサンプラーは間引けないため、元の件数を下回る値を指定するとエラーになる)。
+- `sampling_strategy='auto'`は多クラスでも「最多クラス以外を全て最多クラスの件数に合わせる」("not majority"相当)という意味になる。今回、自動指定では3クラス全てが700件になったのに対し、dict指定では0(700件)はそのまま据え置きつつ1・2だけを300件に増やす、といった細かい制御ができる。
+
+### `SMOTEN(...)`
+
+**用途**: 全ての特徴量がカテゴリ変数であるデータ専用のSMOTE。数値変数とカテゴリ変数が混在する場合は`SMOTENC`(7節)、数値変数のみなら通常の`SMOTE`を使う。
+
+**シグネチャ**: `imblearn.over_sampling.SMOTEN(categorical_encoder=None, *, sampling_strategy='auto', random_state=None, k_neighbors=5)`
+
+**使用例**:
+```python
+import numpy as np
+from collections import Counter
+from imblearn.over_sampling import SMOTEN
+
+rng = np.random.RandomState(0)
+n = 300
+y = np.array([0] * 270 + [1] * 30)
+X_cat = np.empty((n, 3), dtype=object)
+for i in range(n):
+    if y[i] == 0:
+        X_cat[i] = rng.choice(["A", "B", "C"], size=3, p=[0.6, 0.3, 0.1])
+    else:
+        X_cat[i] = rng.choice(["A", "B", "C"], size=3, p=[0.1, 0.3, 0.6])
+
+print("before:", Counter(y))
+smn = SMOTEN(random_state=0)
+Xr, yr = smn.fit_resample(X_cat, y)
+print("after:", Counter(yr))
+print("unique values col0:", np.unique(Xr[:, 0]))
+```
+実行結果:
+```
+before: Counter({np.int64(0): 270, np.int64(1): 30})
+after: Counter({np.int64(0): 270, np.int64(1): 270})
+unique values col0: ['A' 'B' 'C']
+```
+
+**注意点・落とし穴**:
+- `SMOTENC`と異なり`categorical_features`引数は不要(全列がカテゴリという前提のため位置引数が無い)。
+- 数値列の補間のような連続値は生成されず、合成後も各列の値は必ず元から存在するカテゴリ値のいずれかになる(検証でも生成後のユニーク値が`['A', 'B', 'C']`のまま変わらないことを確認)。
+
+### `KMeansSMOTE(...)`
+
+**用途**: 通常のSMOTEが全体の近傍情報だけを使うのに対し、事前にKMeansでクラスタリングしてから「少数派の密度が高い」クラスタ内で重点的にSMOTE的補間を行う派生手法。
+
+**シグネチャ**: `imblearn.over_sampling.KMeansSMOTE(*, sampling_strategy='auto', random_state=None, k_neighbors=2, n_jobs=None, kmeans_estimator=None, cluster_balance_threshold='auto', density_exponent='auto')`
+
+**使用例**:
+```python
+from collections import Counter
+from sklearn.datasets import make_classification
+from imblearn.over_sampling import KMeansSMOTE
+
+X, y = make_classification(
+    n_samples=1000, n_features=5, n_informative=3, n_redundant=0,
+    n_clusters_per_class=1, weights=[0.9, 0.1], flip_y=0, random_state=0,
+)
+kms = KMeansSMOTE(random_state=0)
+Xr, yr = kms.fit_resample(X, y)
+print(Xr.shape, Counter(yr))
+print(kms.kmeans_estimator_)
+```
+実行結果:
+```
+(1800, 5) Counter({np.int64(0): 900, np.int64(1): 900})
+MiniBatchKMeans(random_state=0)
+```
+
+**注意点・落とし穴**:
+- `k_neighbors`のデフォルトは`5`ではなく`2`(通常の`SMOTE`と異なる)。
+- `kmeans_estimator=None`の場合、内部でクラスタリングに使われるのは`sklearn.cluster.KMeans`ではなく`sklearn.cluster.MiniBatchKMeans`である(`fit_resample`後の`kmeans_estimator_`属性で確認済み)。
+- ソースコード(`imblearn/over_sampling/_smote/cluster.py`)を確認したところ、`cluster_balance_threshold`の条件を満たすクラスタが1つも見つからない場合は`RuntimeError("No clusters found with sufficient samples of ...")`になる実装になっている(今回検証した程度のデータ規模ではこのエラーは再現しなかったため、実際に発生する具体的な条件までは未検証)。
+
+### `imblearn.utils.check_sampling_strategy(...)`
+
+**用途**: `sampling_strategy`(`'auto'`・float・dict・callable)の指定を、実際に「クラスごとに何件追加/削除するか」を表す辞書に解決する内部ユーティリティ。自作サンプラー(8-1節)の`_fit_resample`内で`self.sampling_strategy_`が具体的に何を意味するかを確認するのに使える。
+
+**シグネチャ**: `imblearn.utils.check_sampling_strategy(sampling_strategy, y, sampling_type, **kwargs)`
+
+**使用例**:
+```python
+import numpy as np
+from imblearn.utils import check_sampling_strategy
+
+y3 = np.array([0] * 700 + [1] * 200 + [2] * 100)
+print(check_sampling_strategy("auto", y3, "over-sampling"))
+print(check_sampling_strategy({1: 300, 2: 300}, y3, "over-sampling"))
+
+y_bin = np.array([0] * 900 + [1] * 100)
+print(check_sampling_strategy(0.5, y_bin, "over-sampling"))
+```
+実行結果:
+```
+OrderedDict({np.int64(1): np.int64(500), np.int64(2): np.int64(600)})
+OrderedDict({1: np.int64(100), 2: np.int64(200)})
+OrderedDict({np.int64(1): np.int64(350)})
+```
+
+**注意点・落とし穴**:
+- 戻り値は「最終的な目標件数」ではなく「追加で生成する件数」を表す辞書である。例えば`{1: 300, 2: 300}`(元は1が200件・2が100件)という最終件数の指定は、実際には「1に100件、2に200件を追加生成する」という意味の辞書に変換される。
+- `dict`で指定した場合のキーはPythonの`int`のまま保持されるが、`'auto'`や`float`で指定した場合のキーは`y`のdtypeに合わせて`np.int64`になる、という型の違いがある(検証済み)。この関数はimblearn内部の全サンプラーの`fit_resample`から呼ばれている。
+
+**8-3. `imblearn.metrics` の残りの指標**
+
+### `macro_averaged_mean_absolute_error(...)`
+
+**用途**: 順序のある多クラスラベル(例: 5段階評価などの序数)に対し、クラスごとにMAEを計算してからクラス数で単純平均する評価指標。クラスごとの出現頻度に依存しにくく、不均衡な順序ラベルの評価に向く。
+
+**シグネチャ**: `imblearn.metrics.macro_averaged_mean_absolute_error(y_true, y_pred, *, sample_weight=None)`
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.metrics import mean_absolute_error
+from imblearn.metrics import macro_averaged_mean_absolute_error
+
+y_true = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3, 4, 5])
+y_pred = np.array([1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4, 4])
+print("macro MAE:", macro_averaged_mean_absolute_error(y_true, y_pred))
+print("plain MAE:", mean_absolute_error(y_true, y_pred))
+```
+実行結果:
+```
+macro MAE: 0.34444444444444444
+plain MAE: 0.2857142857142857
+```
+
+**注意点・落とし穴**:
+- 通常の`sklearn.metrics.mean_absolute_error`(全サンプルにわたる単純平均)と異なり、先にクラスごとにMAEを計算してからクラス間で平均するため、サンプル数の少ないクラスの誤差も均等に反映される。今回のデータは件数の多いラベル1の予測がほぼ正確だったため、通常のMAE(0.286)よりmacro版(0.344)の方が大きい値になった(=通常のMAEだと少数ラベルの誤差が見えにくくなっていたことを意味する)。
+
+### `sensitivity_score(...)`
+
+**用途**: 再現率(recall)と同義のsensitivity(真陽性率)をスカラー値で返す、`sensitivity_specificity_support`(6節)の簡易版。
+
+**シグネチャ**: `imblearn.metrics.sensitivity_score(y_true, y_pred, *, labels=None, pos_label=1, average='binary', sample_weight=None)`
+
+**使用例**:
+```python
+import numpy as np
+from imblearn.metrics import sensitivity_score, specificity_score
+
+yb_true = np.array([0] * 270 + [1] * 30)
+rng = np.random.RandomState(0)
+yb_pred = yb_true.copy()
+flip_idx = rng.choice(len(yb_true), size=15, replace=False)
+yb_pred[flip_idx] = 1 - yb_pred[flip_idx]
+
+print("sensitivity:", sensitivity_score(yb_true, yb_pred, average="binary"))
+```
+実行結果:
+```
+sensitivity: 0.9666666666666667
+```
+
+**注意点・落とし穴**:
+- 計算内容はsklearn本体の`recall_score`とほぼ同じで、`average`のデフォルトも`'binary'`で揃っている。`specificity_score`(次項)と対にして使うことを想定した命名になっている。
+
+### `specificity_score(...)`
+
+**用途**: 特異度(真陰性率、陰性クラスをどれだけ正しく陰性と判定できたか)をスカラー値で返す。scikit-learn本体には直接対応する関数がない。
+
+**シグネチャ**: `imblearn.metrics.specificity_score(y_true, y_pred, *, labels=None, pos_label=1, average='binary', sample_weight=None)`
+
+**使用例**:
+```python
+print("specificity:", specificity_score(yb_true, yb_pred, average="binary"))
+```
+実行結果:
+```
+specificity: 0.9481481481481482
+```
+
+**注意点・落とし穴**:
+- scikit-learn本体には特異度を直接計算する関数が無く、通常は`confusion_matrix`から自前で計算するか、この関数を使う必要がある。`sensitivity_score`と`specificity_score`を組み合わせれば`sensitivity_specificity_support`と同じ値をスカラー関数として個別に取得できる。
+
+### `imblearn.metrics.pairwise.ValueDifferenceMetric`
+
+**用途**: カテゴリ変数のみからなるデータに対して、特徴値ごとのクラスラベルとの共起確率の差に基づく距離(Value Difference Metric)を計算する。`NearMiss`や`EditedNearestNeighbours`など、通常はユークリッド距離を前提とするk近傍ベースの手法をカテゴリデータに適用する際の距離行列として使える。
+
+**シグネチャ**: `imblearn.metrics.pairwise.ValueDifferenceMetric(*, n_categories='auto', k=1, r=2)`
+
+**使用例**:
+```python
+import numpy as np
+from imblearn.metrics.pairwise import ValueDifferenceMetric
+
+rng = np.random.RandomState(0)
+n = 200
+y = np.array([0] * 180 + [1] * 20)
+X_cat = np.empty((n, 2), dtype=int)
+for i in range(n):
+    if y[i] == 0:
+        X_cat[i] = rng.choice([0, 1, 2], size=2, p=[0.6, 0.3, 0.1])
+    else:
+        X_cat[i] = rng.choice([0, 1, 2], size=2, p=[0.1, 0.3, 0.6])
+
+vdm = ValueDifferenceMetric(n_categories="auto")
+vdm.fit(X_cat, y)
+dist = vdm.pairwise(X_cat[:4])
+print(dist.shape)
+print(np.round(dist, 3))
+```
+実行結果:
+```
+(4, 4)
+[[0.    0.063 0.    0.   ]
+ [0.063 0.    0.063 0.063]
+ [0.    0.063 0.    0.   ]
+ [0.    0.063 0.    0.   ]]
+```
+
+**注意点・落とし穴**:
+- `n_categories`にint(例: `3`)を直接渡すと`sklearn.utils._param_validation.InvalidParameterError`になる(検証済み)。`'auto'`(列ごとに自動検出)か、列ごとのカテゴリ数を並べた配列で指定する必要がある。
+- `SMOTE`などのように`fit_resample`を1回呼ぶ形式ではなく、`fit(X, y)`でラベルとの共起確率を学習した後に`pairwise(X)`で距離行列を計算する、scikit-learnの距離学習系クラスに近い2段階のAPIになっている。
+
+**8-4. コスト考慮型学習との組み合わせ**
+
+### `sklearn.utils.class_weight.compute_class_weight(...)`
+
+**用途**: imblearn本体の関数ではないが、リサンプリングと同じ「不均衡データへの対処」を、データを複製・合成せずに損失関数側の誤分類コストを調整することで行う「コスト考慮型学習」のための重み計算に使う。リサンプリングとどちらが有効かを比較する目的でよく併記される。
+
+**シグネチャ**: `sklearn.utils.class_weight.compute_class_weight(class_weight, *, classes, y, sample_weight=None)`
+
+**使用例**:
+```python
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import balanced_accuracy_score
+from sklearn.utils.class_weight import compute_class_weight
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline
+
+X, y = make_classification(
+    n_samples=1000, n_features=5, n_informative=3, n_redundant=0,
+    n_clusters_per_class=1, weights=[0.9, 0.1], flip_y=0, random_state=0,
+)
+print(compute_class_weight(class_weight="balanced", classes=np.array([0, 1]), y=y))
+
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, stratify=y, random_state=0)
+
+pred_plain = LogisticRegression(max_iter=1000).fit(Xtr, ytr).predict(Xte)
+pred_cw = LogisticRegression(max_iter=1000, class_weight="balanced").fit(Xtr, ytr).predict(Xte)
+pred_smote = Pipeline([("smote", SMOTE(random_state=0)),
+                        ("clf", LogisticRegression(max_iter=1000))]).fit(Xtr, ytr).predict(Xte)
+pred_both = Pipeline([("smote", SMOTE(random_state=0)),
+                       ("clf", LogisticRegression(max_iter=1000, class_weight="balanced"))]).fit(Xtr, ytr).predict(Xte)
+
+for name, pred in [("plain", pred_plain), ("class_weight", pred_cw),
+                    ("SMOTE", pred_smote), ("SMOTE+class_weight", pred_both)]:
+    print(f"{name:20s} balanced_accuracy={balanced_accuracy_score(yte, pred):.4f}")
+```
+実行結果:
+```
+[0.55555556 5.        ]
+plain                balanced_accuracy=0.9833
+class_weight         balanced_accuracy=0.9981
+SMOTE                balanced_accuracy=1.0000
+SMOTE+class_weight   balanced_accuracy=1.0000
+```
+
+**注意点・落とし穴**:
+- `class_weight='balanced'`は`n_samples / (n_classes * np.bincount(y))`という式で重みを計算し、今回のデータ(多数派900・少数派100)では多数派に約0.556、少数派に約5.0という重みを与える(データそのものは複製・合成せず、損失関数側で少数派の誤分類コストを重くする)。
+- 今回の検証データでは`class_weight='balanced'`のみでもSMOTEにかなり近い改善が得られ、`SMOTE`と`class_weight='balanced'`を併用しても単独の`SMOTE`からさらなる改善は見られなかった。リサンプリングとコスト考慮型学習は原理的には代替手段であり、両方を機械的に重ねがけしても常に上乗せ効果があるとは限らない(次項も参照)。
+
+### `BalancedRandomForestClassifier(class_weight=...)`(リサンプリングとの併用)
+
+**用途**: `imblearn.ensemble.BalancedRandomForestClassifier`(5節)は各決定木のブートストラップサンプリング自体が既にクラスごとの件数を揃える(内部的なアンダーサンプリング)。ここにsklearn由来の`class_weight`(コスト考慮型)をさらに重ねがけした場合に、性能が上乗せされるのか確認する(直前の`compute_class_weight`の例と同じ`Xtr, Xte, ytr, yte`をそのまま使う)。
+
+**シグネチャ**: `imblearn.ensemble.BalancedRandomForestClassifier(n_estimators=100, *, ..., sampling_strategy='all', replacement=True, ..., class_weight=None, ...)`(全シグネチャは5節参照)
+
+**使用例**:
+```python
+from imblearn.ensemble import BalancedRandomForestClassifier
+from sklearn.metrics import balanced_accuracy_score
+
+brf_default = BalancedRandomForestClassifier(n_estimators=100, random_state=0)
+brf_default.fit(Xtr, ytr)
+pred1 = brf_default.predict(Xte)
+
+brf_cw = BalancedRandomForestClassifier(n_estimators=100, random_state=0, class_weight="balanced_subsample")
+brf_cw.fit(Xtr, ytr)
+pred2 = brf_cw.predict(Xte)
+
+print("sampling only:          ", balanced_accuracy_score(yte, pred1))
+print("sampling + class_weight:", balanced_accuracy_score(yte, pred2))
+```
+実行結果:
+```
+sampling only:           0.9259259259259259
+sampling + class_weight: 0.8981481481481481
+```
+
+**注意点・落とし穴**:
+- リサンプリング(内部的なアンダーサンプリング)と`class_weight='balanced_subsample'`(コスト考慮)を併用しても必ず性能が上がるわけではない。今回の検証データでは、むしろ`class_weight`を追加した方がbalanced accuracyが下がった(0.926→0.898)。既にクラス比が調整済みのブートストラップサンプルに対してさらに重み付けを行う「二重補正」が、逆に予測を偏らせた可能性がある。
+- リサンプリングとコスト考慮型学習のどちらか一方、あるいは両方の組み合わせが最適かはデータに強く依存するため、機械的に両方オンにするのではなく、検証データ(交差検証)で実際に比較して選ぶべきである。
 
