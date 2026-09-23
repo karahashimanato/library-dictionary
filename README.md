@@ -33,6 +33,18 @@ Python主要ライブラリの関数・API逆引き辞書。ライブラリご�
 | pyod | 3.6.5 | [pyod/README.md](pyod/README.md) |
 | featuretools | 1.31.0 | [featuretools/README.md](featuretools/README.md) |
 
+## 比較ドキュメント
+
+複数ライブラリを横断して使い分けを整理するドキュメント。個別ライブラリのAPI逆引きとは別に`comparisons/`配下にまとめる。
+
+| テーマ | ドキュメント |
+|---|---|
+| DataFrameライブラリ(pandas vs polars) | [comparisons/dataframe-libraries.md](comparisons/dataframe-libraries.md) |
+| 勾配ブースティング(xgboost/lightgbm/catboost) | [comparisons/gradient-boosting.md](comparisons/gradient-boosting.md) |
+| ディープラーニングフレームワーク(pytorch vs jax) | [comparisons/deep-learning-frameworks.md](comparisons/deep-learning-frameworks.md) |
+| scikit-learn系API(scikit-learn/scikit-survival/pyod/imblearn) | [comparisons/sklearn-family-api.md](comparisons/sklearn-family-api.md) |
+| 既知のライブラリ間非互換性まとめ | [comparisons/known-incompatibilities.md](comparisons/known-incompatibilities.md) |
+
 ## 運用ルール
 
 - 新しいライブラリを追加したら、上の表に追記し、`<library>/README.md`を同じ形式(用途・シグネチャ・使用例・実行結果・注意点)で作成する。
