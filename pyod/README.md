@@ -12,6 +12,12 @@ PyOD 3.6.5 で検証済み。すべてのシグネチャ・実行結果は `/hom
 6. [クラスタリングベース手法](#6-クラスタリングベース手法)
 7. [アンサンブル手法・スコア統合](#7-アンサンブル手法スコア統合)
 8. [ニューラルネットワーク系](#8-ニューラルネットワーク系)
+9. [応用・発展](#応用発展)
+   - 9.1 [閾値選択(pyod.models.thresholds)](#91-閾値選択pyodmodelsthresholds)
+   - 9.2 [ニューラルネットワーク系検出器(応用)](#92-ニューラルネットワーク系検出器応用)
+   - 9.3 [モデルの永続化](#93-モデルの永続化)
+   - 9.4 [時系列向け異常検知](#94-時系列向け異常検知)
+   - 9.5 [実データでのcontamination推定の実践パターン](#95-実データでのcontamination推定の実践パターン)
 
 ---
 
@@ -772,3 +778,365 @@ AutoEncoder predict(test)[:5]: [0 0 0 0 0]
 - `preprocessing=True`(デフォルト)により、内部で自動的に`StandardScaler`相当の標準化が行われる(元の`X_train`をそのまま渡してよい)。
 - 内部実装はPyTorch製(`device=None`ならGPUがあれば自動使用)。デフォルトの`hidden_neuron_list=[64, 32]`は次元数が少ないデータにはやや過剰な場合があり、今回の例のように小さいデータセットでは`hidden_neuron_list`を明示的に縮小した方が安定する。
 - `epoch_num`(デフォルト10)が小さいと収束前に学習が終わる。`random_state=42`を指定していても、環境やPyTorchのバージョンによって厳密な再現性が保証されない場合がある点はニューラルネット系全般の注意点。
+
+---
+
+## 応用・発展
+
+ここから先は、基礎編(1〜8章)では扱わなかった、より発展的・ニッチなAPIを扱う。標準の`pip install pyod`だけでは使えないものもあり、その場合は依存パッケージを明記する。
+
+### 9.1 閾値選択(pyod.models.thresholds)
+
+#### `pyod.models.thresholds` の概要と `FILTER(...)`
+
+**用途**: `contamination`という事前知識(異常割合)を人手で指定する代わりに、`decision_scores_`の分布そのものから外れ値/正常値の閾値を自動推定するモジュール。内部的には追加パッケージ`pythresh`(本検証環境ではインストール済み、`pythresh==1.1.1`)のクラスをそのまま返す薄いラッパー関数になっている。`FILTER`はスコア列を信号とみなし、フィルタリング処理(デフォルトはSavitzky-Golayフィルタ)を通して外れ値境界を求める手法。
+
+**シグネチャ**: `pyod.models.thresholds.FILTER(method='savgol', sigma='auto', random_state=1234)` (実体は`pythresh.thresholds.filter.FILTER`を返す関数。`AUCP`/`IQR`など他の閾値クラスも同様に`**kwargs`を`pythresh`側にそのまま渡す関数として実装されている)
+
+**使用例**:
+```python
+from pyod.utils.data import generate_data
+from pyod.models.knn import KNN
+from pyod.models.thresholds import FILTER
+
+X_train, X_test, y_train, y_test = generate_data(
+    n_train=200, n_test=100, n_features=2, contamination=0.1, random_state=42
+)
+clf = KNN(contamination=0.1).fit(X_train)
+scores = clf.decision_scores_
+
+filt = FILTER(method="medfilt")
+labels = filt.eval(scores)
+print("FILTER labels_[:10]:", labels[:10])
+print("推定contamination:", round(labels.mean(), 4))
+print("thresh_:", round(filt.thresh_, 4))
+```
+実行結果:
+```
+FILTER labels_[:10]: [0 0 0 0 0 0 0 0 0 0]
+推定contamination: 0.085
+thresh_: 0.3927
+```
+
+**注意点・落とし穴**:
+- `pyod.models.thresholds`配下のクラス(`FILTER`, `AUCP`, `IQR`など全30種)は`class`ではなく`def FILTER(**kwargs): ... return FILTER_thres(**kwargs)`という**関数**として実装されている(`inspect.signature`が`(*args, **kwargs)`しか返さず、詳細パラメータはdocstringでしか確認できない)。返ってくるインスタンスの実体は`pyod`ではなく`pythresh`パッケージのクラスであり、`pythresh`が未インストールの環境では`ImportError`になる。
+- `eval(decision)`はスコア配列を渡すと即座にラベルを返す一括処理。sklearn風に`fit(X).predict(X)`と2段階で呼ぶAPIも用意されているが、`predict`は`fit`を先に呼んでいないと`NotFittedError`になる(実際に確認済み)。`eval`の方が手軽。
+
+#### `AUCP(...)`
+
+**用途**: スコアのカーネル密度推定(KDE)の曲線下面積(Area Under Curve)を使い、「平均+|平均-中央値|」を境に外れ値/正常値を分ける非パラメトリックな閾値手法。`contamination`のような割合の事前指定が不要。
+
+**シグネチャ**: `pyod.models.thresholds.AUCP(random_state=1234)`
+
+**使用例**:
+```python
+from pyod.models.thresholds import AUCP
+
+aucp = AUCP()
+labels = aucp.eval(scores)
+print("AUCP labels_[:10]:", labels[:10])
+print("推定contamination:", round(labels.mean(), 4))
+print("thresh_:", round(aucp.thresh_, 4))
+```
+実行結果:
+```
+AUCP labels_[:10]: [0 0 0 0 0 0 0 0 0 0]
+推定contamination: 0.095
+thresh_: 0.1729
+```
+
+**注意点・落とし穴**:
+- 今回のKNNスコア(良好に分離した人工データ)では真のcontamination(0.1)に近い0.095を推定できたが、手法によって推定結果が大きくブレることがある(9.5節で、同じデータでもECODスコアに対して`AUCP`と`FILTER`が0.305 vs 0.08という大きく異なる推定値を出す例を確認している)。単一の閾値手法の出力を無条件に信頼せず、複数手法を比較するか、ドメイン知識で妥当性を確認すべき。
+
+#### 検出器への thresholder の直接組み込み(`contamination=`)
+
+**用途**: `pyod`の各検出器(`KNN`, `HBOS`など)の`contamination`引数は、`float`だけでなく`pyod.models.thresholds`(=`pythresh`)の閾値インスタンスをそのまま渡せる。渡すと、固定の割合ではなく上記のような自動閾値推定ロジックで`labels_`/`threshold_`が計算される。
+
+**シグネチャ**: `KNN(contamination=<float または pythresh.thresholds.base.BaseThresholder インスタンス>, ...)`(`BaseDetector`共通)
+
+**使用例**:
+```python
+from pyod.models.knn import KNN
+from pyod.models.thresholds import IQR
+
+clf = KNN(contamination=IQR())
+clf.fit(X_train)
+print("labels_[:10]:", clf.labels_[:10])
+print("labels_.sum():", int(clf.labels_.sum()))
+print("threshold_:", round(clf.threshold_, 4))
+print("contamination:", clf.contamination)
+```
+実行結果:
+```
+labels_[:10]: [0 0 0 0 0 0 0 0 0 0]
+labels_.sum(): 25
+threshold_: 0.1077
+contamination: IQR()
+```
+
+**注意点・落とし穴**:
+- `contamination=0.1`(float)で`KNN`を学習した場合は`labels_.sum()`が20件(2章で確認済み)だったが、`contamination=IQR()`にすると25件に変化する。`contamination`属性自体もfloatではなく渡した`IQR()`インスタンスがそのまま格納される点に注意(`type(clf.contamination)`は`pythresh.thresholds.iqr.IQR`)。
+- 実務でどのthresholderを選ぶべきか自明ではない。9.5節の通り、`AUCP`/`FILTER`/`IQR`は同じスコアに対しても異なる推定contaminationを出すため、複数を試してレンジを把握するのが安全。
+
+### 9.2 ニューラルネットワーク系検出器(応用)
+
+#### `DeepSVDD(...)`
+
+**用途**: One-Class SVMの発想をニューラルネットワークに拡張し、正常データを特徴空間内の1点(中心`c`)の周りに写像するよう学習する深層異常検知手法(Deep Support Vector Data Description)。中心からの距離を異常スコアとする。
+
+**シグネチャ**: `pyod.models.deep_svdd.DeepSVDD(n_features, c=None, use_ae=False, hidden_neurons=None, hidden_activation='relu', output_activation='sigmoid', optimizer='adam', epochs=100, batch_size=32, dropout_rate=0.2, l2_regularizer=5e-07, validation_size=0.1, preprocessing=True, verbose=1, random_state=None, contamination=0.1, learning_rate=0.0001)`
+
+**使用例**:
+```python
+from pyod.utils.data import generate_data
+from pyod.models.deep_svdd import DeepSVDD
+
+X_train, X_test, y_train, y_test = generate_data(
+    n_train=200, n_test=100, n_features=10, contamination=0.1, random_state=42
+)
+clf = DeepSVDD(n_features=10, epochs=3, hidden_neurons=[16, 8],
+                contamination=0.1, random_state=42, verbose=0)
+clf.fit(X_train)
+print("decision_scores_[:5]:", clf.decision_scores_[:5].round(3))
+print("predict(test)[:5]:", clf.predict(X_test)[:5])
+```
+実行結果:
+```
+Epoch 1/3, Loss: 1.441234927624464
+Epoch 2/3, Loss: 1.523838832974434
+Epoch 3/3, Loss: 1.346273947507143
+decision_scores_[:5]: [0.063 0.052 0.05  0.058 0.07 ]
+predict(test)[:5]: [0 0 0 0 0]
+```
+
+**注意点・落とし穴**:
+- 他の検出器と異なり、コンストラクタの第1引数`n_features`は**必須**(デフォルトなし)。渡さずに`DeepSVDD()`を呼ぶと`TypeError: DeepSVDD.__init__() missing 1 required positional argument: 'n_features'`になる(実際に確認済み)。`AutoEncoder`のように入力データから自動推論はされない。
+- `verbose=0`を指定しても、上記実行結果の通り`Epoch i/N, Loss: ...`という学習ログは抑制されない。`pyod 3.6.5`同梱の`deep_svdd.py`のソースを確認したところ、学習ループ末尾の`print(f"Epoch {epoch + 1}/{self.epochs}, Loss: {epoch_loss}")`が`self.verbose`の値を一切参照せず無条件に実行されているためで、`verbose`引数の実装漏れと考えられる(ログを抑制する公式な方法はない)。
+
+#### `LUNAR(...)`
+
+**用途**: グラフニューラルネットワーク(GNN)でk近傍情報を学習し、近傍距離を異常スコアに変換する深層学習ベースの近傍法(Learnable Unified Neighbourhood-based Anomaly Ranking)。古典的なKNN/LOFの「固定的な集約方法」をニューラルネットに置き換えたもの。
+
+**シグネチャ**: `pyod.models.lunar.LUNAR(model_type='WEIGHT', n_neighbours=5, negative_sampling='MIXED', val_size=0.1, scaler=None, epsilon=0.1, proportion=1.0, n_epochs=200, lr=0.001, wd=0.1, verbose=0, contamination=0.1, algorithm='auto', leaf_size=30, metric='minkowski', p=2, metric_params=None, n_jobs=1, random_state=None)`
+
+**使用例**:
+```python
+from pyod.models.lunar import LUNAR
+
+clf = LUNAR(n_neighbours=5, n_epochs=20, contamination=0.1, verbose=0, random_state=42)
+clf.fit(X_train)
+print("decision_scores_[:5]:", clf.decision_scores_[:5].round(3))
+print("labels_[:5]:", clf.labels_[:5])
+print("predict(test)[:5]:", clf.predict(X_test)[:5])
+```
+実行結果:
+```
+decision_scores_[:5]: [0.08  0.138 0.043 0.088 0.085]
+labels_[:5]: [0 0 0 0 0]
+predict(test)[:5]: [0 0 0 0 0]
+```
+
+**注意点・落とし穴**:
+- `LUNAR`は`DeepSVDD`と対照的に、`verbose=0`にすると学習ログが正しく抑制される(実際に確認済み)。同じ「ニューラル系・`verbose`引数あり」でもモデルによって実装の徹底度に差があるため、ログ出力の挙動は個別に確認した方がよい。
+- デフォルトの`n_epochs=200`は今回のような小規模データセットには重いため、検証目的では`n_epochs`を大きく減らして動作確認するのが現実的(上の例では20に縮小)。
+
+### 9.3 モデルの永続化
+
+#### `joblib.dump` / `joblib.load` によるモデル保存・復元
+
+**用途**: 学習済みの`pyod`検出器を丸ごとファイルに保存し、後で(同じプロセスを再起動しても)`fit`をやり直さずに`predict`/`decision_function`を呼べるようにする。`pyod`の検出器は通常のPythonオブジェクトなので、scikit-learn同様`joblib`でシリアライズできる。
+
+**シグネチャ**: `joblib.dump(value, filename)` / `joblib.load(filename)`(`joblib`パッケージ、`pyod`固有のAPIではない)
+
+**使用例**:
+```python
+import numpy as np
+from joblib import dump, load
+from pyod.models.knn import KNN
+
+clf = KNN(contamination=0.1).fit(X_train)
+
+dump(clf, "/tmp/knn_model.joblib")
+clf_loaded = load("/tmp/knn_model.joblib")
+
+print("type:", type(clf_loaded).__name__)
+print("predict一致:", np.array_equal(clf.predict(X_test), clf_loaded.predict(X_test)))
+print("decision_function一致:", np.allclose(clf.decision_function(X_test), clf_loaded.decision_function(X_test)))
+```
+実行結果:
+```
+type: KNN
+predict一致: True
+decision_function一致: True
+```
+
+**注意点・落とし穴**:
+- `KNN`のような古典的な検出器だけでなく、PyTorchベースの`AutoEncoder`でも同様に動作することを確認済み(次項参照)。`fit`済みの内部状態(近傍探索木、ニューラルネットの重みなど)を含めてそのまま復元される。
+- 保存されるのは学習済みインスタンスそのものであり、`pyod`/`scikit-learn`/`torch`のバージョンが保存時と読み込み時で異なる環境間の互換性までは検証していない(本検証は同一環境内での保存・復元のみ)。
+
+#### `pickle`(標準ライブラリ)との比較
+
+**用途**: `joblib`を使わず、Python標準の`pickle`でも`pyod`検出器(PyTorchベースの`AutoEncoder`を含む)を保存・復元できるかを確認する。
+
+**シグネチャ**: `pickle.dump(obj, file)` / `pickle.load(file)`(標準ライブラリ)
+
+**使用例**:
+```python
+import pickle
+import numpy as np
+from pyod.models.auto_encoder import AutoEncoder
+
+ae = AutoEncoder(hidden_neuron_list=[16, 8], epoch_num=5, contamination=0.1,
+                  random_state=42, verbose=0)
+ae.fit(X_train)  # n_features=10のX_train
+
+with open("/tmp/ae_model.pkl", "wb") as f:
+    pickle.dump(ae, f)
+with open("/tmp/ae_model.pkl", "rb") as f:
+    ae_loaded = pickle.load(f)
+
+print("type:", type(ae_loaded).__name__)
+print("decision_function一致:", np.allclose(ae.decision_function(X_test), ae_loaded.decision_function(X_test)))
+```
+実行結果:
+```
+type: AutoEncoder
+decision_function一致: True
+```
+
+**注意点・落とし穴**:
+- PyTorchベースの`AutoEncoder`であっても標準`pickle`だけで問題なく保存・復元できることを確認済み(GPU不使用・単一プロセス内の検証)。`joblib`は内部的に`pickle`ベースで大きなNumPy配列の扱いに最適化がある程度で、`pyod`検出器の保存自体に`joblib`が必須というわけではない。
+- 同一環境・同一プロセス内での往復のみを確認しており、異なるマシン(特にGPU環境↔CPU環境間)での互換性は本辞書では未検証。
+
+### 9.4 時系列向け異常検知
+
+#### `TimeSeriesOD(...)`
+
+**用途**: 通常の`pyod`検出器(`IForest`, `ECOD`など点ごとの異常検知手法)を時系列データに適用できるようにする「窓化(windowing)」のブリッジクラス。時系列をスライディングウィンドウに切り出して既存の検出器に食わせ、ウィンドウ単位のスコアを元のタイムスタンプ単位に写像し直す。
+
+**シグネチャ**: `pyod.models.ts_od.TimeSeriesOD(detector='IForest', window_size=50, step=1, score_aggregation='max', contamination=0.1)`
+
+**使用例**:
+```python
+import numpy as np
+from pyod.models.ts_od import TimeSeriesOD
+
+rng = np.random.RandomState(42)
+ts = np.sin(np.linspace(0, 20 * np.pi, 500)) + rng.normal(0, 0.05, 500)
+ts[250:255] += 5  # 異常スパイクを注入(インデックス250-254)
+
+clf = TimeSeriesOD(detector="IForest", window_size=20, step=1, contamination=0.05)
+clf.fit(ts)
+print("decision_scores_.shape:", clf.decision_scores_.shape)
+flagged = np.where(clf.labels_)[0]
+print("異常フラグが立った範囲:", flagged.min(), "-", flagged.max())
+print("labels_[248:258]:", clf.labels_[248:258])
+```
+実行結果:
+```
+decision_scores_.shape: (500,)
+異常フラグが立った範囲: 237 - 258
+labels_[248:258]: [1 1 1 1 1 1 1 1 1 1]
+```
+
+**注意点・落とし穴**:
+- `decision_scores_`/`labels_`の長さは元の時系列の長さ(`n_timestamps`)と一致するよう自動的に写像し直される(内部でスライディングウィンドウのスコアを`score_aggregation`(デフォルト`'max'`)で集約)。
+- 「窓のにじみ(window smearing)」に注意。250-254の5点にしか異常を注入していないのに、`window_size=20`では237-258という21点分に異常フラグが立った(注入区間の前後に`window_size`程度のマージンで広がる)。異常の正確な発生時刻をピンポイントで特定したい場合は`window_size`を小さくするか、後段で「区間の開始点」を別途特定するロジックが必要。
+- `detector`引数には`'IForest'`のような文字列(内部のショートカット登録から解決)だけでなく、他の`pyod`検出器インスタンスをそのまま渡すこともできる(渡した場合は内部で`clone`される)。
+
+#### 多変量時系列への適用
+
+**用途**: `TimeSeriesOD`は1次元の時系列だけでなく、`(n_timestamps, n_channels)`形状の多変量時系列にもそのまま適用できることを確認する。
+
+**シグネチャ**: `TimeSeriesOD.fit(X)` の `X` に `(n_timestamps, n_channels)` 形状の`ndarray`を渡す
+
+**使用例**:
+```python
+import numpy as np
+from pyod.models.ts_od import TimeSeriesOD
+
+rng = np.random.RandomState(42)
+t = np.linspace(0, 20 * np.pi, 500)
+ts = np.column_stack([np.sin(t), np.cos(t)]) + rng.normal(0, 0.05, (500, 2))
+ts[300:303] += 4  # 2チャンネル同時に異常を注入(インデックス300-302)
+
+clf = TimeSeriesOD(detector="ECOD", window_size=15, step=1,
+                     score_aggregation="mean", contamination=0.05)
+clf.fit(ts)
+print("ts.shape:", ts.shape, "-> decision_scores_.shape:", clf.decision_scores_.shape)
+flagged = np.where(clf.labels_)[0]
+print("異常フラグが立った範囲:", flagged.min(), "-", flagged.max())
+```
+実行結果:
+```
+ts.shape: (500, 2) -> decision_scores_.shape: (500,)
+異常フラグが立った範囲: 289 - 313
+```
+
+**注意点・落とし穴**:
+- 多チャンネルの時系列でも`decision_scores_`は`(n_timestamps,)`という1次元配列に集約される(チャンネルごとのスコアは返らない)。
+- ここでも「窓のにじみ」が確認できる。300-302の3点にしか異常を注入していないが、`window_size=15`では289-313という25点分にフラグが立っており、`window_size`が大きいほどにじみ幅も広がる傾向が見て取れる。
+
+### 9.5 実データでのcontamination推定の実践パターン
+
+#### `contamination`は`decision_scores_`自体には影響しない
+
+**用途**: `contamination`パラメータが検出器のどこに効いているのかを実際に確認する。実務では「正しいcontamination値が分からない」状態でまずスコアだけ計算し、後から閾値を調整したいことが多いため、この性質を理解しておくと効率的に試行できる。
+
+**シグネチャ**: `ECOD(contamination=<float>)`(`BaseDetector`共通のパラメータ)
+
+**使用例**:
+```python
+import numpy as np
+from pyod.models.ecod import ECOD
+
+ecod_a = ECOD(contamination=0.05).fit(X_train)
+ecod_b = ECOD(contamination=0.3).fit(X_train)
+print("decision_scores_が一致:", np.allclose(ecod_a.decision_scores_, ecod_b.decision_scores_))
+
+for c in [0.05, 0.1, 0.2, 0.3]:
+    clf = ECOD(contamination=c).fit(X_train)
+    print("contamination=%.2f -> labels_.sum()=%d, threshold_=%.3f" % (c, clf.labels_.sum(), clf.threshold_))
+```
+実行結果:
+```
+decision_scores_が一致: True
+contamination=0.05 -> labels_.sum()=10, threshold_=6.321
+contamination=0.10 -> labels_.sum()=20, threshold_=5.648
+contamination=0.20 -> labels_.sum()=40, threshold_=4.368
+contamination=0.30 -> labels_.sum()=60, threshold_=3.775
+```
+
+**注意点・落とし穴**:
+- `contamination`は`decision_scores_`(連続スコア)の計算には一切影響せず、`threshold_`と`labels_`(0/1判定)にのみ影響する。実務では、まず`contamination`のデフォルト値(0.1など仮の値)でモデルを`fit`してスコアを確認し、後から`threshold_`相当の閾値だけを別途探索する(9.1節の`thresholds`モジュールや、`labels_.sum()`をターゲットの異常件数に合わせて`contamination`を逆算する、など)方が、モデルの再学習コストを抑えられる。
+- 上の実行結果からも分かる通り、`labels_.sum()`は`contamination × n_train`にほぼ比例する(200件中、0.05→10件、0.1→20件、0.2→40件、0.3→60件)。`contamination`は「割合」であって「件数」ではない点に注意。
+
+#### thresholderによる自動contamination推定とその限界
+
+**用途**: 正解ラベルが手元にない実データで、9.1節の`thresholds`モジュールを使って「妥当なcontamination」を推定するパターンと、その手法間のブレの大きさを確認する。
+
+**シグネチャ**: `pyod.models.thresholds.AUCP().eval(decision_scores_)` / `pyod.models.thresholds.FILTER().eval(decision_scores_)`
+
+**使用例**:
+```python
+from pyod.models.ecod import ECOD
+from pyod.models.thresholds import AUCP, FILTER
+
+ecod = ECOD().fit(X_train)
+scores = ecod.decision_scores_
+
+for name, thres in [("AUCP", AUCP()), ("FILTER", FILTER())]:
+    labels = thres.eval(scores)
+    print(name, "推定contamination:", round(labels.mean(), 4))
+print("正解(参考):", round(y_train.mean(), 4))
+```
+実行結果:
+```
+AUCP 推定contamination: 0.305
+FILTER 推定contamination: 0.08
+正解(参考): 0.1
+```
+
+**注意点・落とし穴**:
+- 同じ`ECOD`のスコアに対して、`AUCP`は0.305、`FILTER`は0.08と、真の値0.1を挟んで大きく異なる推定値を出した。同じデータに対して同じ検出器のスコアを使っても、どのthresholderを選ぶかで結果が数倍単位でブレうることが実際に確認できる。
+- 実務でのパターンとしては、(1) 複数のthresholderを試してレンジ(この例なら0.08〜0.305)を把握する、(2) 可能であれば少数のラベル付きサンプルやドメイン知識(「過去の実績では異常は全体の数%程度」等)で検証・補正する、(3) 単一の自動推定値をそのまま本番の閾値として採用しない、という3点が安全側の運用になる。9.1節で見た通り`KNN`スコアに対する`AUCP`(0.095)は真値0.1に近かったが、これは検出器・データセットの組み合わせに依存する結果であり、一般に「この手法が最も正確」と言えるだけの根拠は今回の検証範囲にはない。
