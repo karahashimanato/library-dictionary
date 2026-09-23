@@ -18,6 +18,11 @@ Python主要ライブラリの関数・API逆引き辞書。ライブラリご�
 | polars | 1.44.1 | [polars/README.md](polars/README.md) |
 | seaborn | 0.13.2 | [seaborn/README.md](seaborn/README.md) |
 | statsmodels | 0.14.6 | [statsmodels/README.md](statsmodels/README.md) |
+| imblearn | 0.14.2 | [imblearn/README.md](imblearn/README.md) |
+| optuna | 4.9.0 | [optuna/README.md](optuna/README.md) |
+| xgboost | 3.4.1 | [xgboost/README.md](xgboost/README.md) |
+| catboost | 1.2.10 | [catboost/README.md](catboost/README.md) |
+| lightgbm | 4.7.0 | [lightgbm/README.md](lightgbm/README.md) |
 
 ## 運用ルール
 
