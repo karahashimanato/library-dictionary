@@ -14,6 +14,11 @@ PyTensor は PyMC の内部で使われているシンボリック計算グラ�
 6. [形状操作](#形状操作)
 7. [共有変数](#共有変数)
 8. [グラフの可視化・デバッグ](#グラフの可視化デバッグ)
+9. [応用・発展](#応用発展)
+   - [グラフ最適化(rewrite/optimizer)](#グラフ最適化rewriteoptimizer)
+   - [カスタムOpの自作](#カスタムopの自作)
+   - [勾配の応用](#勾配の応用)
+   - [別バックエンドへのコンパイル](#別バックエンドへのコンパイル)
 
 ---
 
@@ -838,3 +843,435 @@ Sum{axes=None} [id A] <Scalar(float64, shape=())>
 - `a == b` のような Python 標準の等価演算子は要素ごとの比較にならない(オブジェクト同一性の `bool` を返す)。要素ごとの比較には `pt.eq`/`pt.neq` を使う(詳細は上記「比較演算子」の項を参照)。
 - 配列への破壊的な要素代入(`a[i] = x`)はできない。書き換えたい場合は `pt.set_subtensor` で「新しいグラフ」を作る。
 - `pt.constant(1.0)` のように `dtype` を省略すると `float32` になることがあり、`float64` の変数と混ぜると型エラーになりやすい。迷ったら `dtype` を明示する。
+
+---
+
+## 応用・発展
+
+### グラフ最適化(rewrite/optimizer)
+
+#### `pytensor.function` の `mode` 引数と最適化レベル
+
+**用途**: コンパイル時にどのレベルのグラフ書き換え(rewrite/最適化)を適用するかを切り替える。`FAST_RUN` は積極的に最適化してから実行し、`FAST_COMPILE` は最適化をほぼ省略してコンパイル自体を高速化する。
+
+**使用例**:
+```python
+import pytensor
+import pytensor.tensor as pt
+
+x = pt.scalar('x')
+y = x ** 2
+f_run = pytensor.function([x], y, mode='FAST_RUN')
+f_compile = pytensor.function([x], y, mode='FAST_COMPILE')
+print('--- FAST_RUN ---')
+pytensor.dprint(f_run)
+print('--- FAST_COMPILE ---')
+pytensor.dprint(f_compile)
+print(f_run(4.0), f_compile(4.0))
+```
+実行結果:
+```
+--- FAST_RUN ---
+Sqr [id A] 0
+ └─ x [id B]
+--- FAST_COMPILE ---
+Pow [id A] 0
+ ├─ x [id B]
+ └─ 2 [id C]
+16.0 16.0
+```
+
+**注意点・落とし穴**:
+- `FAST_RUN` では `x ** 2` という `Pow` 演算が専用の `Sqr`(2乗専用)Opに書き換えられており、実行されるグラフの構造そのものが変わっている。最終的な計算結果は同じだが、`dprint` で見えるノードは最適化レベルによって異なる。
+- デバッグ時に「グラフがどう実行されるか」を確認したい場合、`mode='FAST_COMPILE'` の方が元のコード(`x ** 2`)に近い素直なグラフになり読みやすい。
+
+---
+
+#### `pytensor.graph.rewrite_graph(graph, include=(...))`
+
+**用途**: `pytensor.function` を経由せず、シンボリックグラフ単体に対して明示的にグラフ書き換え(rewrite)を適用し、最適化後のグラフを取得する。グラフ最適化の効果を単体で確認したいときに使う。
+
+**シグネチャ**: `pytensor.graph.rewrite_graph(graph, include=('canonicalize',), custom_rewrite=None, clone=False, **kwargs)`
+
+**使用例**:
+```python
+import pytensor
+import pytensor.tensor as pt
+from pytensor.graph import rewrite_graph
+
+x = pt.scalar('x')
+y = (x + 0.0) * 1.0
+print('最適化前:')
+pytensor.dprint(y)
+y_opt = rewrite_graph(y, include=('canonicalize',))
+print('最適化後:')
+pytensor.dprint(y_opt)
+```
+実行結果:
+```
+最適化前:
+Mul [id A]
+ ├─ Add [id B]
+ │  ├─ x [id C]
+ │  └─ 0.0 [id D]
+ └─ 1.0 [id E]
+最適化後:
+x [id A]
+```
+
+**注意点・落とし穴**:
+- `+0.0` や `*1.0` のような恒等演算が完全に消え、グラフが `x` そのものに簡約される。「グラフ最適化」が単なる高速化ではなく、代数的に等価なグラフへの書き換えであることが視覚的にわかる例。
+- `include` に渡す文字列(`'canonicalize'` など)は `pytensor.compile.mode` 内部の rewrite データベースの登録名に対応する。どの名前がどの書き換え群を指すかは PyTensor 内部の実装に依存し、公開ドキュメントが薄いため、実際に `dprint` で前後を比較しながら使うのが実用的。
+
+---
+
+### カスタムOpの自作
+
+#### `Op` 基底クラスの最小実装(`make_node` / `perform`)
+
+**用途**: PyTensor に組み込まれていない演算を、独自の `Op` として計算グラフに組み込む。`make_node` で入出力の型(`Apply` ノード)を定義し、`perform` で実際の数値計算(numpy レベル)を書く。
+
+**使用例**:
+```python
+import numpy as np
+import pytensor
+import pytensor.tensor as pt
+from pytensor.graph.op import Op
+from pytensor.graph.basic import Apply
+
+class DoubleOp(Op):
+    __props__ = ()  # このOpはパラメータを持たない
+
+    def make_node(self, x):
+        x = pt.as_tensor_variable(x)
+        return Apply(self, [x], [x.type()])  # 入力1つ、同じ型の出力1つ
+
+    def perform(self, node, inputs, output_storage):
+        (x,) = inputs
+        output_storage[0][0] = np.asarray(x * 2)
+
+double_op = DoubleOp()
+x = pt.vector('x')
+f = pytensor.function([x], double_op(x))
+print(f(np.array([1.0, 2.0, 3.0])))
+```
+実行結果:
+```
+[2. 4. 6.]
+```
+
+**注意点・落とし穴**:
+- `__props__ = ()` は必須に近い。これを定義しないと `Op` 同士の等価性判定(グラフのマージ最適化などで使われる)が正しく動かないことがある。
+- `perform` の `output_storage` は「1要素のリストを1個含むリスト」という独特の形(`output_storage[0][0] = 値`)で書き込む。numpy 配列をそのまま `return` するわけではない点が初見でつまずきやすい。
+- この最小実装では `grad`(下記参照)を定義していないため、この `DoubleOp` を含むグラフに対して `pytensor.grad` を呼ぶとエラーになる。
+
+---
+
+#### `Op.grad(inputs, output_grads)` による独自勾配の定義
+
+**用途**: カスタム `Op` に対して `pytensor.grad` が使えるように、逆伝播時の勾配計算式を定義する。
+
+**使用例**:
+```python
+import numpy as np
+import pytensor
+import pytensor.tensor as pt
+from pytensor.graph.op import Op
+from pytensor.graph.basic import Apply
+
+class DoubleOp(Op):
+    __props__ = ()
+
+    def make_node(self, x):
+        x = pt.as_tensor_variable(x)
+        return Apply(self, [x], [x.type()])
+
+    def perform(self, node, inputs, output_storage):
+        (x,) = inputs
+        output_storage[0][0] = np.asarray(x * 2)
+
+    def grad(self, inputs, output_grads):
+        (gz,) = output_grads
+        return [gz * 2]  # d(2x)/dx = 2
+
+double_op = DoubleOp()
+x = pt.vector('x')
+g = pytensor.grad(double_op(x).sum(), x)
+print(g.eval({x: np.array([1.0, 2.0, 3.0])}))
+```
+実行結果:
+```
+[2. 2. 2.]
+```
+
+**注意点・落とし穴**:
+- `grad` は「入力ごとの勾配式のリスト」を返す必要がある(`inputs` と同じ長さ)。多入力Opで一部の入力に勾配が定義できない場合は、後述の `grad_not_implemented` / `grad_undefined` を該当位置に入れる。
+- 検証環境(3.3.0)では `grad`/`L_op` を実装すると `FutureWarning: <OpName> should implement \`pullback\` instead of \`L_op\`/\`grad\`. Direct \`L_op\`/\`grad\` implementations are deprecated and will stop being called in a future version.` という警告が出る。現時点では `grad` の実装でも動作するが、PyTensor は内部的に新しい `pullback` フックへの移行を進めている。
+
+---
+
+#### `pytensor.gradient.verify_grad(fun, pt, ...)`
+
+**用途**: 数値微分(有限差分)と解析的勾配(`Op.grad` で定義した式)を比較し、カスタム `Op` の勾配実装が正しいかを自動検証する。
+
+**シグネチャ**: `verify_grad(fun, pt, n_tests=2, rng=None, eps=None, out_type=None, abs_tol=None, rel_tol=None, mode=None, cast_to_output_type=False, no_debug_ref=True)`
+
+**使用例**:
+```python
+import numpy as np
+from pytensor.gradient import verify_grad
+import pytensor.tensor as pt
+from pytensor.graph.op import Op
+from pytensor.graph.basic import Apply
+
+class WrongDoubleOp(Op):
+    __props__ = ()
+
+    def make_node(self, x):
+        x = pt.as_tensor_variable(x)
+        return Apply(self, [x], [x.type()])
+
+    def perform(self, node, inputs, output_storage):
+        (x,) = inputs
+        output_storage[0][0] = np.asarray(x * 2)
+
+    def grad(self, inputs, output_grads):
+        (gz,) = output_grads
+        return [gz * 3]  # わざと間違った勾配(正しくは *2)
+
+wrong_op = WrongDoubleOp()
+rng = np.random.default_rng(0)
+verify_grad(wrong_op, [np.array([1.0, 2.0, 3.0])], rng=rng)
+```
+実行結果:
+```
+pytensor.gradient.GradientError: GradientError: numeric gradient and analytic gradient exceed tolerance:
+        At position 2 of argument 0 with shape (3,),
+            val1 = 1.622921      ,  val2 = 1.081947
+            abs. error = 0.540974,  abs. tolerance = 0.000100
+            rel. error = 0.200000,  rel. tolerance = 0.000100
+```
+
+**注意点・落とし穴**:
+- `pt` 引数(第2引数)は `pytensor.tensor` モジュールのエイリアスとは別物で、検証したい入力値の numpy 配列のリスト。慣習的な引数名が `pt` になっているため `import pytensor.tensor as pt` と名前が衝突する点に注意(この辞書の他の例と同様に `pt` を tensor モジュールのエイリアスとして使っている場合、`verify_grad` 呼び出し時は位置引数で渡すか変数名を変えるとよい)。
+- 上記の例では `grad` をわざと `gz * 3`(正しくは `gz * 2`)にしており、`verify_grad` が数値微分との差(誤差)を検出して `GradientError` を送出することを実機で確認した。正しい勾配(`gz * 2`)に直すと例外は発生しない。
+
+---
+
+### 勾配の応用
+
+#### `pytensor.gradient.disconnected_grad(x)`
+
+**用途**: グラフの一部を「勾配計算の対象外」として明示的に切り離す。ある変数がコスト関数の計算には使われるが、その経路については逆伝播させたくない場合に使う(stop-gradient に相当)。
+
+**シグネチャ**: `disconnected_grad(x)`
+
+**使用例**:
+```python
+import pytensor
+import pytensor.tensor as pt
+from pytensor.gradient import disconnected_grad
+
+x = pt.scalar('x')
+y = x ** 2
+y_blocked = disconnected_grad(y)
+z = y_blocked + x   # z = stop_grad(x**2) + x
+g = pytensor.grad(z, x)
+print(g.eval({x: 3.0}))
+```
+実行結果:
+```
+1.0
+```
+**注意点・落とし穴**:
+- `z = x**2 + x` であれば `dz/dx = 2x + 1 = 7.0`(`x=3` のとき)になるはずだが、`disconnected_grad` で `x**2` の経路を切り離しているため、実際の勾配は `x` の項(傾き `1`)のみが伝播し `1.0` になる。この差分が `disconnected_grad` の効果そのもの。
+
+---
+
+#### `pytensor.gradient.grad_not_implemented` / `grad_undefined`
+
+**用途**: カスタム `Op.grad` の中で、特定の入力に対する勾配が「未実装」(`grad_not_implemented`)なのか「数学的に定義できない」(`grad_undefined`)のかを区別しつつ、その入力の勾配計算を試みた時点でエラーを発生させる。
+
+**シグネチャ**: `grad_not_implemented(op, x_pos, x, comment='')` / `grad_undefined(op, x_pos, x, comment='')`
+
+**使用例**:
+```python
+import numpy as np
+import pytensor
+import pytensor.tensor as pt
+from pytensor.graph.op import Op
+from pytensor.graph.basic import Apply
+from pytensor.gradient import grad_undefined
+
+class RoundOp(Op):
+    __props__ = ()
+
+    def make_node(self, x):
+        x = pt.as_tensor_variable(x)
+        return Apply(self, [x], [x.type()])
+
+    def perform(self, node, inputs, output_storage):
+        (x,) = inputs
+        output_storage[0][0] = np.asarray(np.round(x))
+
+    def grad(self, inputs, output_grads):
+        return [grad_undefined(self, 0, inputs[0], 'round() の勾配はほぼ至る所で0だが整数点で未定義')]
+
+op = RoundOp()
+x = pt.vector('x')
+y = op(x).sum()
+try:
+    pytensor.grad(y, x)
+except Exception as e:
+    print(type(e).__name__, ':', str(e))
+```
+実行結果:
+```
+NullTypeGradError : `grad` encountered a NaN. This variable is Null because the grad method for input 0 (x) of the RoundOp op is undefined. round() の勾配はほぼ至る所で0だが整数点で未定義
+```
+
+**注意点・落とし穴**:
+- `grad_not_implemented`/`grad_undefined` の docstring 上は、それぞれ `NotImplementedError`/`GradUndefinedError` が送出されると説明されているが、検証環境(3.3.0)で実際に `pytensor.grad` を呼んで確認したところ、どちらも送出される例外の型は共通して `pytensor.gradient.NullTypeGradError` だった。エラーメッセージの文面(「not implemented」か「undefined」か、および `comment` で渡した文字列)は使い分けに応じて変わるが、`except` 節で型を分けて捕捉することはできない点に注意。
+
+---
+
+#### `pytensor.gradient.hessian(cost, wrt)`
+
+**用途**: スカラーコスト関数の2階微分(ヘッシアン行列)を計算する。
+
+**シグネチャ**: `hessian(cost, wrt, consider_constant=None, disconnected_inputs='raise')`
+
+**使用例**:
+```python
+import numpy as np
+import pytensor.tensor as pt
+from pytensor.gradient import hessian
+
+v = pt.vector('v')
+cost = (v ** 2).sum() + v[0] * v[1]
+H = hessian(cost, v)
+print(H.eval({v: np.array([1.0, 2.0])}))
+```
+実行結果:
+```
+[[2. 1.]
+ [1. 2.]]
+```
+
+**注意点・落とし穴**:
+- `cost = v0^2 + v1^2 + v0*v1` の解析的ヘッシアンは `[[2, 1], [1, 2]]` で、実行結果はこれと一致する。要素数が多い `wrt` に対して計算するとコストが `O(次元数^2)` で増えるため、大規模モデルでは PyMC 側でも多用は避けられる。
+
+---
+
+#### `pytensor.gradient.Rop` / `Lop`(前進・後退モード微分)
+
+**用途**: ヤコビアンとベクトルの積(JVP: `Rop`, 前進モード)、およびヤコビアンの転置とベクトルの積(VJP: `Lop`, 後退モード)を、フルのヤコビ行列を陽に作らずに計算する。
+
+**シグネチャ**: `Rop(f, wrt, eval_points, disconnected_outputs='raise', return_disconnected='zero', use_op_rop_implementation=False)` / `Lop(f, wrt, eval_points, consider_constant=None, disconnected_inputs='raise', return_disconnected='zero')`
+
+**使用例**:
+```python
+import numpy as np
+import pytensor.tensor as pt
+from pytensor.gradient import Rop, Lop
+
+w = pt.vector('w')
+f_expr = w ** 2
+
+ev = pt.vector('ev')
+rop = Rop(f_expr, w, ev)
+print('Rop ->', rop.eval({w: np.array([1., 2., 3.]), ev: np.array([1., 1., 1.])}))
+
+og = pt.vector('og')
+lop = Lop(f_expr, w, og)
+print('Lop ->', lop.eval({w: np.array([1., 2., 3.]), og: np.array([1., 1., 1.])}))
+```
+実行結果:
+```
+Rop -> [2. 4. 6.]
+Lop -> [2. 4. 6.]
+```
+
+**注意点・落とし穴**:
+- `f = w**2` はヤコビアンが対角行列 `diag(2w)` になるため、`eval_points` がすべて `1` の場合 `Rop`/`Lop` の結果はどちらも `2w`(`[2, 4, 6]`)に一致する。一般の非対称なヤコビアンを持つ関数では `Rop` と `Lop` の結果は一致しない。
+- 検証環境(3.3.0)では `Rop`/`Lop` を呼ぶと `FutureWarning: Rop is deprecated, use pushforward instead.` / `FutureWarning: Lop is deprecated, use pullback instead.` が出る。実体は動作するが、PyTensor は新しい名前 `pytensor.gradient.pushforward` / `pullback` への移行を進めており、新規コードではそちらの使用が推奨される。
+
+---
+
+### 別バックエンドへのコンパイル
+
+#### `pytensor.function(..., mode="NUMBA")`
+
+**用途**: 計算グラフを Numba の JIT コンパイラ経由でネイティブコードにコンパイルして実行する。
+
+**使用例**:
+```python
+import pytensor
+import pytensor.tensor as pt
+import numpy as np
+
+x = pt.vector('x')
+y = pt.exp(x).sum()
+f_numba = pytensor.function([x], y, mode='NUMBA')
+out = f_numba(np.array([1.0, 2.0, 3.0]))
+print(out, type(out))
+```
+実行結果:
+```
+30.19287485057736 <class 'numpy.ndarray'>
+```
+
+**注意点・落とし穴**:
+- 検証環境には `numba`(0.66.0)がインストール済みで、追加設定なしに `mode='NUMBA'` が使えた。戻り値の型は通常の(C/Pythonバックエンドの)`function` と同じ `numpy.ndarray`。
+- 下記「既定のリンカ」の項で述べる通り、この検証環境では `mode` を省略した場合の既定コンパイル先が実質的に Numba になっている。
+
+---
+
+#### `pytensor.function(..., mode="JAX")`
+
+**用途**: 計算グラフを JAX の `jit` 経由でコンパイルして実行する。
+
+**使用例**:
+```python
+import pytensor
+import pytensor.tensor as pt
+import numpy as np
+
+x = pt.vector('x')
+y = pt.exp(x).sum()
+f_jax = pytensor.function([x], y, mode='JAX')
+out = f_jax(np.array([1.0, 2.0, 3.0]))
+print(out, type(out))
+```
+実行結果:
+```
+30.192874850577365 <class 'jaxlib._jax.ArrayImpl'>
+```
+
+**注意点・落とし穴**:
+- 検証環境には `jax`(0.11.1)がインストール済みで動作した。ただし CUDA 対応の `jaxlib` が無い環境のため、実行時に `An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib is not installed. Falling back to cpu.` という警告が標準エラーに出力される(計算結果には影響しない)。
+- `mode='NUMBA'` の場合と異なり、戻り値は `numpy.ndarray` ではなく `jaxlib._jax.ArrayImpl`。さらに実行結果の値も `30.19287485057736`(NUMBA/通常)と `30.192874850577365`(JAX)で最後の桁がわずかに異なった(浮動小数点演算の順序・実装差による丸め誤差)。バックエンド間で bit-exact な一致は保証されない点に注意。
+
+---
+
+#### 既定のリンカ(`pytensor.config.linker`)の実体
+
+**用途**: `pytensor.function` に `mode` を明示しなかった場合に、実際にはどのバックエンドでコンパイルされるのかを確認する。
+
+**使用例**:
+```python
+import pytensor
+from pytensor.compile.mode import get_default_mode
+
+print(pytensor.config.linker)
+print(get_default_mode().linker)
+```
+実行結果:
+```
+auto
+NumbaLinker()
+```
+
+**注意点・落とし穴**:
+- `pytensor.config.linker` の値は `'auto'` だが、PyTensor 内部の実装(`pytensor/compile/mode.py`)では `linker == "auto"` の場合に `"numba"` へ解決するようハードコードされている。つまり検証環境(3.3.0)では、`mode` を指定せずに `pytensor.function` を呼んだ場合、伝統的な C/Python バックエンドではなく **Numba バックエンドが既定で使われる**。
+- この辞書の他の項目(例: `pytensor.function` の基本例)で `mode` を指定せずにコンパイルした関数も、実際には内部で Numba 経由の JIT コンパイルが行われている。初回呼び出し時に Numba のコンパイルコストがかかる、`perform` しか実装していないカスタムOpでは「Numba will use object mode to run ... 's perform method」という警告が出る、といった実務上の影響がある(上記カスタムOpの例で実際に観測した)。

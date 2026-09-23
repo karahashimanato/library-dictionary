@@ -10,6 +10,11 @@ ruptures 1.1.10 で検証済み。すべてのシグネチャ・実行結果は 
 4. [評価指標](#4-評価指標)
 5. [可視化](#5-可視化)
 6. [パラメータ・チューニング](#6-パラメータチューニング)
+7. [応用・発展](#7-応用発展)
+   - 7.1 [カスタムコスト関数の自作・拡張](#71-カスタムコスト関数の自作拡張)
+   - 7.2 [多変量信号・欠損値のある信号への対応](#72-多変量信号欠損値のある信号への対応)
+   - 7.3 [実データでの閾値選定の実践パターン](#73-実データでの閾値選定の実践パターン)
+   - 7.4 [オンライン・ストリーミング風の逐次検出](#74-オンラインストリーミング風の逐次検出)
 
 ---
 
@@ -616,3 +621,295 @@ for jump in [1, 5, 20]:
 **注意点・落とし穴**:
 - `jump=1`にすると候補点が間引かれず最も精度が高くなる(この例では真の変化点`[51, 103, 149]`とほぼ一致)。`jump=20`のように粗くすると検出位置のズレが大きくなる(`40`や`160`のように真の値から大きくずれる)。
 - `KernelCPD`のみ、コンストラクタに`jump`引数はあるものの**常に1に固定され、指定しても無視される**(公式docstringに明記、ソースコードでも`self.jump = 1  # set to 1`と確認済み)。
+
+---
+
+## 7. 応用・発展
+
+### 7.1 カスタムコスト関数の自作・拡張
+
+#### `BaseCost` を継承したカスタムコスト関数
+
+**用途**: 既存のコスト関数(L1/L2/RBF等)にない独自の当てはまり基準を実装し、`Pelt`等の検出アルゴリズムにそのまま組み込む。`ruptures.base.BaseCost`は`fit`/`error`/`model`(プロパティ)を実装すれば良い抽象基底クラス。
+
+**シグネチャ**: `ruptures.base.BaseCost`(抽象基底クラス)。必須実装: `fit(self, *args, **kwargs)` / `error(self, start, end)` / `model`(クラス変数としての文字列プロパティ)。組み込み実装(`sum_of_costs(self, bkps)`)は変化点リストからセグメント別コストの合計を計算する。
+
+**使用例**:
+```python
+import numpy as np
+import ruptures as rpt
+from ruptures.base import BaseCost
+from ruptures.exceptions import NotEnoughPoints
+
+class CostMAD(BaseCost):
+    """Median Absolute Deviation ベースのロバストなコスト(外れ値に強い)。"""
+    model = "custom_mad"
+
+    def __init__(self):
+        self.signal = None
+        self.min_size = 2
+
+    def fit(self, signal):
+        if signal.ndim == 1:
+            signal = signal.reshape(-1, 1)
+        self.signal = signal
+        return self
+
+    def error(self, start, end):
+        if end - start < self.min_size:
+            raise NotEnoughPoints
+        sub = self.signal[start:end]
+        med = np.median(sub, axis=0)
+        return np.abs(sub - med).sum()
+
+signal, true_bkps = rpt.pw_constant(n_samples=200, n_features=1, n_bkps=3, noise_std=1, seed=42)
+
+algo = rpt.Pelt(custom_cost=CostMAD(), min_size=2, jump=5).fit(signal)
+print(algo.predict(pen=30))
+print(algo.cost.model)
+```
+実行結果:
+```
+[50, 105, 150, 200]
+custom_mad
+```
+
+**注意点・落とし穴**:
+- `error()`が`min_size`未満のセグメントに対して`NotEnoughPoints`(`ruptures.exceptions`)を送出する規約は、既存の`CostL2`等の実装と同じ。これを守らないと`Pelt`等の内部探索でセグメント長の制約が効かなくなる。
+- `custom_cost=CostMAD()`のように**インスタンス**を渡す(`model="custom_mad"`という文字列ではなく)のが基本の使い方。
+
+#### 文字列`model=`によるカスタムコストの自動登録
+
+**用途**: 一度`BaseCost`のサブクラスを定義してインポートしておけば、`custom_cost=`でインスタンスを渡さなくても`model="<自作のmodel文字列>"`という**文字列だけ**で呼び出せる。`ruptures.costs.cost_factory`の実装に由来する挙動。
+
+**シグネチャ**: `ruptures.costs.cost_factory(model, *args, **kwargs)` — 内部で`BaseCost.__subclasses__()`を走査し、`cls.model == model`に一致するクラスをインスタンス化する。
+
+**使用例**:
+```python
+# 前の例で定義した CostMAD クラスが同一プロセス内に存在する状態で、
+# custom_cost= を渡さず、model="custom_mad" という文字列だけで動くか
+algo = rpt.Pelt(model="custom_mad", min_size=2, jump=5).fit(signal)
+print(algo.predict(pen=30))
+```
+実行結果:
+```
+[50, 105, 150, 200]
+```
+
+**注意点・落とし穴**:
+- `cost_factory`は`BaseCost.__subclasses__()`(Pythonの標準機能、**そのクラスを継承した全サブクラスをインポート時点で自動収集**)を使っている。そのため、**クラス定義(=モジュールのインポート)さえ実行されていれば**、`custom_cost=`を渡さなくても文字列指定だけで動いてしまう(実行確認済み)。裏を返すと、`model`文字列が既存のコスト名(`"l2"`等)や他で定義済みの自作コストと衝突すると、意図しないクラスが選ばれる危険がある。命名は具体的にすること。
+
+### 7.2 多変量信号・欠損値のある信号への対応
+
+#### 3次元以上の多変量信号
+
+**用途**: `pw_constant`の`n_features`を3以上にした多変量信号でも、`CostL2`等は追加の設定なしにそのまま動く(`error()`内部で`.var(axis=0).sum()`のように各次元のコストを合算しているため)。特徴量を絞るかどうかで検出結果が変わりうる点を確認する。
+
+**使用例**:
+```python
+signal, true_bkps = rpt.pw_constant(n_samples=200, n_features=5, n_bkps=3, noise_std=1, seed=42)
+print(signal.shape, true_bkps)
+
+algo = rpt.Pelt(model="l2", min_size=2, jump=5).fit(signal)
+print("5特徴量:", algo.predict(pen=50))
+
+algo1 = rpt.Pelt(model="l2", min_size=2, jump=5).fit(signal[:, :1])
+print("1特徴量のみ:", algo1.predict(pen=50))
+```
+実行結果:
+```
+(200, 5) [51, 103, 149, 200]
+5特徴量: [50, 100, 105, 145, 150, 200]
+1特徴量のみ: [50, 105, 150, 200]
+```
+
+**注意点・落とし穴**:
+- 同じ`pen=50`でも、特徴量数を増やすと検出変化点が増える(この例では5特徴量で6個、1特徴量で4個)。`CostL2`のコストは次元ごとの分散の合計であり次元数に応じて総コストのスケールも変わるため、多変量にする際は`pen`を次元数に応じて調整し直す必要がある(6.節で触れた`pen ≈ log(n) * dim * sigma^2`の目安がここでも有効)。
+
+#### 欠損値(NaN)を含む信号
+
+**用途**: ruptures本体には欠損値の自動処理機構がないため、`NaN`を含む信号を渡すとどうなるかを実際に確認し、実務での前処理(補間)パターンを示す。
+
+**使用例**:
+```python
+import numpy as np
+import pandas as pd
+
+signal, bkps = rpt.pw_constant(n_samples=200, n_features=3, n_bkps=3, noise_std=1, seed=42)
+
+sig_nan = signal.copy()
+rng = np.random.default_rng(0)
+missing_idx = rng.choice(200, size=10, replace=False)
+sig_nan[missing_idx, 0] = np.nan
+print("NaN count:", np.isnan(sig_nan).sum())
+
+algo0 = rpt.Pelt(model="l2").fit(signal)
+print("NaNなし:", algo0.predict(pen=50))
+
+algo1 = rpt.Pelt(model="l2").fit(sig_nan)
+print("NaNあり(未対応):", algo1.predict(pen=50))
+
+df_interp = pd.DataFrame(sig_nan).interpolate(limit_direction="both").to_numpy()
+algo2 = rpt.Pelt(model="l2").fit(df_interp)
+print("線形補間後:", algo2.predict(pen=50))
+```
+実行結果:
+```
+NaN count: 10
+NaNなし: [50, 100, 105, 150, 200]
+NaNあり(未対応): [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150, 155, 160, 165, 170, 175, 180, 185, 190, 195, 200]
+線形補間後: [50, 55, 100, 105, 150, 200]
+```
+
+**注意点・落とし穴**:
+- **重大な落とし穴(実行確認済み)**: `Pelt`は`NaN`を含む信号を渡しても例外を出さない。`CostL2.error()`内部の`.var()`計算が`NaN`を伝播させ、実質すべての区間のコストが`NaN`(比較不能)になり、結果として`jump`刻みのほぼ全候補点が変化点として検出される(この例では39個)という**静かな暴走**が起きる。エラーにならないため気付きにくい。
+- 対処としては、`fit()`に渡す前に`pandas.DataFrame.interpolate()`等で欠損値を補間しておく必要がある。補間後は元のパターン(`[50, 100, 105, 150, 200]`)にかなり近い結果(`[50, 55, 100, 105, 150, 200]`)に戻ることを確認した。
+
+### 7.3 実データでの閾値選定の実践パターン
+
+#### `pen`候補を複数試して比較する
+
+**用途**: 実データでは真の変化点数が未知なため、複数の`pen`候補で`Pelt`を実行し、検出変化点数とセグメンテーション全体のコスト(`algo.cost.sum_of_costs(bkps)`)の推移を見比べる。
+
+**シグネチャ**: `ruptures.base.BaseCost.sum_of_costs(self, bkps)` — 変化点リスト`bkps`(`bkps[-1]==n_samples`)から、各セグメントの`error()`の合計を返す。
+
+**使用例**:
+```python
+signal, true_bkps = rpt.pw_constant(n_samples=200, n_features=1, n_bkps=3, noise_std=1, seed=42)
+n = signal.shape[0]
+algo = rpt.Pelt(model="l2", min_size=2, jump=5).fit(signal)
+
+print(f"{'pen':>4} {'n_bkps':>7} {'sum_of_costs':>13}")
+for pen in [1, 3, 5, 10, 20, 30, 50, 80, 120]:
+    bkps = algo.predict(pen=pen)
+    cost = algo.cost.sum_of_costs(bkps)
+    print(f"{pen:>4} {len(bkps)-1:>7} {cost:>13.3f}")
+```
+実行結果:
+```
+ pen  n_bkps  sum_of_costs
+   1      18       288.232
+   3       8       305.992
+   5       8       305.992
+  10       6       316.363
+  20       5       331.451
+  30       4       353.435
+  50       3       402.463
+  80       3       402.463
+ 120       3       402.463
+```
+
+**注意点・落とし穴**:
+- `pen`を増やすほど`n_bkps`は単調非増加、`sum_of_costs`は単調非減少になる(「変化点を増やすほど当てはまりは良くなるが、増やすコストが上がる」というトレードオフそのもの)。`pen=50`以上では結果が飽和する(同じセグメンテーションに収束する)ことも確認できる。
+
+#### BIC的な基準による`pen`選定
+
+**用途**: 上の`pen`候補一覧に対して、情報量規準に似た「当てはまりの良さ(コスト)+複雑さへの罰則」の合計が最小になる`pen`を選ぶ、という実務でよく使われる簡易パターン。
+
+**使用例**:
+```python
+sigma2 = 1.0  # 既知または事前に推定したノイズ分散
+print(f"{'pen':>4} {'n_bkps':>7} {'cost':>10} {'BIC近似':>10}")
+best_pen, best_bic = None, np.inf
+for pen in [1, 3, 5, 10, 20, 30, 50, 80, 120]:
+    bkps = algo.predict(pen=pen)
+    k = len(bkps) - 1
+    cost = algo.cost.sum_of_costs(bkps)
+    bic = cost + k * np.log(n) * sigma2
+    print(f"{pen:>4} {k:>7} {cost:>10.3f} {bic:>10.3f}")
+    if bic < best_bic:
+        best_bic, best_pen = bic, pen
+print("BIC最小のpen:", best_pen)
+```
+実行結果:
+```
+ pen  n_bkps       cost      BIC近似
+   1      18    288.232    383.602
+   3       8    305.992    348.379
+   5       8    305.992    348.379
+  10       6    316.363    348.153
+  20       5    331.451    357.942
+  30       4    353.435    374.629
+  50       3    402.463    418.358
+  80       3    402.463    418.358
+ 120       3    402.463    418.358
+BIC最小のpen: 10
+```
+
+**注意点・落とし穴**:
+- この基準(`cost + n_bkps * log(n) * sigma^2`)はruptures組み込みのものではなく、あくまで「情報量規準の考え方を`sum_of_costs`に当てはめた」自作の目安。BIC最小の`pen=10`(6変化点)は、真の変化点数3個より多めに出ている(実行確認済み)。`sigma2`の推定値やペナルティの係数次第で最適`pen`は変わるため、この方法だけで機械的に決め打ちせず、`display()`等で目視確認するのが実務では無難。
+- `sum_of_costs`はコスト関数の種類(L1/L2/RBF等)によってスケールがまったく異なるため、この基準を使い回す場合はコスト関数ごとに`sigma2`やペナルティ係数を調整し直す必要がある。
+
+### 7.4 オンライン・ストリーミング風の逐次検出
+
+**補足**: 検証した ruptures 1.1.10 には、オンライン変化点検出(例: BOCPD)専用のクラス(`rpt.Online`等)は存在しない(`dir(ruptures)`で確認済み、`Binseg`/`BottomUp`/`Dynp`/`KernelCPD`/`Pelt`/`Window`の6アルゴリズムのみ)。そのため、新しいデータが到着するたびに既存アルゴリズムを再実行する疑似オンラインパターンで代用する。
+
+#### 逐次再実行によるオンライン検出パターン
+
+**用途**: データが一定間隔で到着する状況を想定し、到着のたびに直近までの信号全体で`Pelt`を再実行し、前回までに検出済みでない新規の変化点だけを「アラーム」として報告する。
+
+**使用例**:
+```python
+signal, true_bkps = rpt.pw_constant(n_samples=200, n_features=1, n_bkps=3, noise_std=1, seed=42)
+
+step = 10
+pen = 20
+detected_so_far = set()
+alarms = []
+
+for t in range(30, len(signal) + 1, step):
+    sub_signal = signal[:t]
+    algo = rpt.Pelt(model="l2", min_size=2, jump=5).fit(sub_signal)
+    bkps = algo.predict(pen=pen)
+    new_bkps = set(bkps[:-1]) - detected_so_far
+    if new_bkps:
+        for b in sorted(new_bkps):
+            alarms.append((t, b))
+        detected_so_far |= new_bkps
+
+print(alarms)
+print("真の変化点:", true_bkps[:-1])
+```
+実行結果:
+```
+[(60, 50), (110, 100), (110, 105), (150, 145), (160, 150)]
+真の変化点: [51, 103, 149]
+```
+
+**注意点・落とし穴**:
+- 「アラーム時刻(t)」と「実際の変化点位置」は一致しない。例えば真の変化点51は`t=60`まで到着データが増えて初めて検出されており、**検出には`step`刻み分(最大10サンプル)のラグが必ず生じる**(実行確認済み)。オンライン検知の即時性を求める場合は`step`を小さくする必要があるが、その分下記の計算コストが増える。
+- `pen=20`は本文6節のバッチ処理と同じ値を使ったが、疑似オンライン(部分信号に対する`Pelt`)では信号長`t`ごとにコストのスケールが変わるため、バッチと同じ`pen`が常に最適とは限らない。
+
+#### 逐次検出の限界(計算コスト・検出ラグ)
+
+**用途**: 「毎回全データで再`fit`する」方式が、データが増えるにつれてどれだけ非効率になるかを実測する。
+
+**使用例**:
+```python
+import time
+
+signal, true_bkps = rpt.pw_constant(n_samples=200, n_features=1, n_bkps=3, noise_std=1, seed=42)
+
+# 疑似オンライン: 毎回全データで再fit
+t0 = time.perf_counter()
+for t in range(30, len(signal) + 1, 10):
+    algo = rpt.Pelt(model="l2", min_size=2, jump=5).fit(signal[:t])
+    algo.predict(pen=20)
+t1 = time.perf_counter()
+print(f"逐次再fit(18回): {t1 - t0:.4f} 秒")
+
+# バッチ: 全データに対して1回だけfit
+t2 = time.perf_counter()
+algo_batch = rpt.Pelt(model="l2", min_size=2, jump=5).fit(signal)
+algo_batch.predict(pen=20)
+t3 = time.perf_counter()
+print(f"バッチ1回fit: {t3 - t2:.4f} 秒")
+```
+実行結果:
+```
+逐次再fit(18回): 0.0269 秒
+バッチ1回fit: 0.0024 秒
+```
+
+**注意点・落とし穴**:
+- 信号長200という小さなデータでも、疑似オンライン方式(18回の再`fit`)はバッチ1回`fit`よりおよそ11倍遅い(実行確認済み、実行環境依存で倍率は変動しうる)。`Pelt`自体は平均的に線形時間だが、「到着のたびに先頭から全部再計算する」実装のため全体では信号長に対して二次的にコストが増える。信号が長くなる・到着頻度が高くなるオンライン用途では、直近`W`サンプルだけを対象にする固定長スライディングウィンドウ(`signal[t-W:t]`)に変えるか、専用のオンラインアルゴリズム(ruptures外のライブラリ、例: `bayesian_changepoint_detection`等)を検討する必要がある。

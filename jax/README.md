@@ -14,6 +14,12 @@ jax 0.11.1 で検証済み(すべてのシグネチャ・出力は `/home/manaty
 8. [Flaxニューラルネット構築(flax.linen基礎)](#flaxニューラルネット構築flaxlinen基礎)
 9. [最適化(optax)](#最適化optax)
 10. [その他(デバッグ・numpy相互運用)](#その他デバッグnumpy相互運用)
+11. [応用・発展](#応用発展)
+    - [低レベル自動微分・カスタム微分ルール(jvp/vjp/custom_jvp/custom_vjp)](#低レベル自動微分カスタム微分ルールjvpvjpcustom_jvpcustom_vjp)
+    - [メモリ最適化・実行時チェック(checkpoint/eval_shape/checkify)](#メモリ最適化実行時チェックcheckpointeval_shapecheckify)
+    - [高度なPytree操作(register_pytree_node/is_leaf)](#高度なpytree操作register_pytree_nodeis_leaf)
+    - [jax.debug応用(callback/breakpoint)](#jaxdebug応用callbackbreakpoint)
+    - [Flax/optaxの高度な機能](#flaxoptaxの高度な機能)
 
 ---
 
@@ -1173,3 +1179,686 @@ print(type(d), d)
 
 **注意点・落とし穴**:
 - `np.asarray(jax配列)` は jax 配列の中身をCPUメモリへコピーして通常の numpy 配列にする(GPU/TPU上の配列であれば暗黙にデバイス間転送が発生する)。大きな配列を頻繁に変換するとパフォーマンスに影響するため、可能な限り `jnp` の API だけで完結させるのが望ましい。
+
+---
+
+## 応用・発展
+
+ここから先は、基礎的な使い方を一通り押さえた上で扱う、より高度・niche な jax / flax / optax の API を扱う。
+
+### 低レベル自動微分・カスタム微分ルール(jvp/vjp/custom_jvp/custom_vjp)
+
+#### `jax.jvp(fun, primals, tangents, has_aux=False)`
+
+**用途**: 前進モード自動微分の低レベルAPI。`grad`/`jacfwd` は内部でこれを使って実装されている。評価点(`primals`)と入力側の方向(`tangents`)を渡すと、出力値とその方向への微分(方向微分)を同時に返す。
+
+**シグネチャ**: `jax.jvp(fun: 'Callable', primals, tangents, has_aux: 'bool' = False) -> 'tuple[Any, ...]'`
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+
+def f(x):
+    return jnp.sin(x) * x
+
+y, y_dot = jax.jvp(f, (2.0,), (1.0,))
+print(y, y_dot)
+print(jax.grad(f)(2.0))
+```
+実行結果:
+```
+1.8185948 0.07700372
+0.07700372
+```
+
+**注意点・落とし穴**:
+- `jax.grad` はスカラー関数の勾配だけを返す高レベルAPIだが、内部的には `jvp`(前進モード)と `vjp`(後退モード)という2つの低レベルAPIの合成で自動微分全体が構成されている。1入力1出力のスカラー関数では、`tangents=(1.0,)` で呼んだ `jvp` の第2戻り値は `grad` の結果と一致する。
+
+---
+
+#### `jax.vjp(fun, *primals, has_aux=False)`
+
+**用途**: 後退モード自動微分の低レベルAPI。関数を評価しつつ、余接ベクトル(コタンジェント)を渡すと勾配を返す関数(vjp関数)を作る。`jax.grad(f)(x)` は本質的に `jax.vjp(f, x)[1](1.0)` と同じ計算をしている。
+
+**シグネチャ**: `jax.vjp(fun: 'Callable', *primals, has_aux: 'bool' = False, reduce_axes=(), saveable_args: 'Any' = True, in_nzs: 'Any' = None) -> 'tuple[Any, Callable] | tuple[Any, Callable, Any]'`
+
+**使用例**:
+```python
+import jax
+
+def f(x):
+    return jax.numpy.sin(x) * x
+
+y, vjp_fn = jax.vjp(f, 2.0)
+print(y)
+print(vjp_fn(1.0))
+```
+実行結果:
+```
+1.8185948
+(Array(0.07700372, dtype=float32, weak_type=True),)
+```
+
+**注意点・落とし穴**:
+- `vjp_fn` は渡した `primals` の数だけの勾配を必ずタプルで返す(単一引数でも `(Array(...),)` のようにタプル)。`custom_vjp` で独自の逆伝播ルールを書く際は、この「入力の数だけの戻り値」という形式に合わせる必要がある。
+
+---
+
+#### `jax.custom_jvp` / `.defjvp(jvp, symbolic_zeros=False)`
+
+**用途**: 関数の前進モード微分規則を手動で定義する。数値的に不安定な微分(0付近での発散など)を避けたい場合や、独自の勾配挙動を実装したい場合に使う。
+
+**シグネチャ**: `jax.custom_jvp(fun=None, nondiff_argnums=(), nondiff_argnames=())`
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+
+@jax.custom_jvp
+def f(x):
+    return jnp.sin(x)
+
+@f.defjvp
+def f_jvp(primals, tangents):
+    x, = primals
+    t, = tangents
+    primal_out = jnp.sin(x)
+    tangent_out = jnp.cos(x) * t
+    return primal_out, tangent_out
+
+print(f(1.0))
+print(jax.grad(f)(1.0))
+print(jax.grad(jnp.sin)(1.0))
+```
+実行結果:
+```
+0.84147096
+0.5403023
+0.5403023
+```
+
+**注意点・落とし穴**:
+- `defjvp` に渡す関数は `(primals, tangents) -> (primal_out, tangent_out)` という決まった形。今回は標準の `sin` と同じ微分規則を手書きしただけなので `jax.grad(jnp.sin)` と一致するが、実運用では数値安定化した近似式などをここに書く。
+
+---
+
+#### `jax.custom_vjp` / `.defvjp(fwd, bwd, symbolic_zeros=False, optimize_remat=False)`
+
+**用途**: 後退モードの微分規則を手動で定義する。勾配クリッピングや straight-through estimator のように、順伝播の値はそのまま通しつつ逆伝播だけを別ルールにしたい場合に使う。
+
+**シグネチャ**: `jax.custom_vjp(fun=None, nondiff_argnums=(), nondiff_argnames=())`
+
+**使用例**(順伝播では値をそのまま通しつつ、逆伝播の勾配だけ `[-0.5, 0.5]` にクリップする):
+```python
+import jax
+import jax.numpy as jnp
+
+@jax.custom_vjp
+def clip_grad(x, lo, hi):
+    return x  # フォワードは恒等関数
+
+def clip_grad_fwd(x, lo, hi):
+    return x, (lo, hi)
+
+def clip_grad_bwd(res, g):
+    lo, hi = res
+    return (jnp.clip(g, lo, hi), None, None)
+
+clip_grad.defvjp(clip_grad_fwd, clip_grad_bwd)
+
+def loss(x):
+    return clip_grad(x, -0.5, 0.5) ** 2 * 10
+
+print(jax.grad(loss)(3.0))
+print(jax.grad(lambda x: x ** 2 * 10)(3.0))
+```
+実行結果:
+```
+0.5
+60.0
+```
+
+**注意点・落とし穴**:
+- `clip_grad` 自体はフォワードでは恒等関数(`x` をそのまま返す)なので、通常なら `x**2*10` の勾配(=`60.0`)になるはずだが、`defvjp` で逆伝播ルールを上書きしているため実際の勾配は `[-0.5, 0.5]` にクリップされた `0.5` になる。フォワードの計算結果とバックワードの勾配計算が完全に独立して定義できることを示す例。
+- `bwd` 関数は「微分しない引数」(`lo`, `hi`)に対しても `None` を含めてタプルの要素数を `fwd` への入力引数の数と揃える必要がある。
+
+---
+
+### メモリ最適化・実行時チェック(checkpoint/eval_shape/checkify)
+
+#### `jax.checkpoint(fun, ...)`(`jax.remat` と同一)
+
+**用途**: 逆伝播(勾配計算)の際に中間の活性化値を保存せず、必要になった時点で順伝播を再計算することでメモリ使用量を削減する「勾配チェックポイント」。深いネットワークでメモリが不足する場合の定番のテクニック。`jax.remat` は同じ関数への別名。
+
+**シグネチャ**: `jax.checkpoint(fun: 'Callable', *, prevent_cse: 'bool | Sequence[bool]' = True, policy: 'Callable[..., bool] | None' = None, static_argnums: 'int | tuple[int, ...]' = (), static_argnames: 'str | Iterable[str]' = ()) -> 'Callable'`
+
+**使用例**(`jax.debug.print` でレイヤーが実際に何回「実行」されるかを可視化):
+```python
+import jax
+import jax.numpy as jnp
+
+def layer(x):
+    jax.debug.print("layer called with x={}", x)
+    return jnp.sin(x)
+
+def f_plain(x):
+    return layer(layer(x))
+
+def f_ckpt(x):
+    l = jax.checkpoint(layer)
+    return l(l(x))
+
+print("--- plain ---")
+jax.grad(f_plain)(1.0)
+print("--- checkpoint ---")
+jax.grad(f_ckpt)(1.0)
+```
+実行結果:
+```
+--- plain ---
+layer called with x=1.0
+layer called with x=0.8414709568023682
+--- checkpoint ---
+layer called with x=1.0
+layer called with x=0.8414709568023682
+layer called with x=0.8414709568023682
+layer called with x=1.0
+```
+
+**注意点・落とし穴**:
+- `plain` 版は順伝播で各レイヤーが1回ずつしか呼ばれない(逆伝播は保存済みの中間値を使う)のに対し、`checkpoint` 版は逆伝播の際に順伝播をもう一度re-runしている(呼び出し回数が2倍になっている)ことが分かる。これは「メモリを節約する代わりに計算時間が増える」というトレードオフを実際の挙動として確認できる例。
+- メモリが逼迫していないモデルに無闇に使うと、純粋に計算時間だけが増えて損をする。メモリボトルネックが実際にある箇所(深いResNet/Transformerの層など)に限定して使うのが定石。
+
+---
+
+#### `jax.eval_shape(fun, *args, **kwargs)`
+
+**用途**: 関数を実際には実行せず(データも確保せず)、出力の shape/dtype だけを推論する。巨大な配列を扱う前に、メモリを確保せず出力形状だけ先に知りたい場合に使う。
+
+**シグネチャ**: `jax.eval_shape(fun: 'Callable', *args, **kwargs)`
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+
+def f(x, y):
+    return jnp.dot(x, y)
+
+out = jax.eval_shape(f, jnp.zeros((3, 4)), jnp.zeros((4, 5)))
+print(out, type(out))
+
+big = jax.eval_shape(
+    f,
+    jax.ShapeDtypeStruct((1000, 1000), jnp.float32),
+    jax.ShapeDtypeStruct((1000, 1000), jnp.float32),
+)
+print(big)
+```
+実行結果:
+```
+ShapeDtypeStruct(shape=(3, 5), dtype=float32) <class 'jax.ShapeDtypeStruct'>
+ShapeDtypeStruct(shape=(1000, 1000), dtype=float32)
+```
+
+**注意点・落とし穴**:
+- 戻り値は実データを持たない `jax.ShapeDtypeStruct`(shape/dtype情報のみ)。引数として実配列の代わりに `jax.ShapeDtypeStruct` をそのまま渡すこともでき、実配列を1つも確保せずに巨大な計算の出力形状だけを一瞬で調べられる。
+
+---
+
+#### `jax.experimental.checkify.checkify(f, errors=...)`
+
+**用途**: NaN の発生やインデックス範囲外アクセスなど、通常は「静かに」処理されてしまうランタイムエラーを明示的にチェックし、検出できるようにするユーティリティ。
+
+**シグネチャ**: `checkify.checkify(f: 'Callable[..., Out]', errors: 'frozenset[ErrorCategory]' = frozenset({<class 'jax._src.checkify.FailedCheckError'>})) -> 'Callable[..., tuple[Error, Out]]'`
+
+**使用例**:
+```python
+import jax.numpy as jnp
+from jax.experimental import checkify
+
+def f(x):
+    return jnp.log(x)
+
+checked_f = checkify.checkify(f, errors=checkify.float_checks)
+err, out = checked_f(jnp.array(-1.0))
+print(out)
+print(err.get())
+```
+実行結果:
+```
+nan
+nan generated by primitive: log.
+```
+
+**注意点・落とし穴**:
+- `checkify.checkify` で包んだ関数は、戻り値が `(Error, 元の出力)` というタプルに変わる。呼び出し側のコードもそれに合わせて書き換える必要がある。
+- `errors` 引数で検出対象の種類を切り替えられる(既定はユーザー定義の `checkify.check` によるアサート失敗のみ。`checkify.float_checks` を渡すと今回のようなNaN/Inf発生も検出できる)。
+
+---
+
+### 高度なPytree操作(register_pytree_node/is_leaf)
+
+#### `jax.tree_util.register_pytree_node(nodetype, flatten_func, unflatten_func, ...)`
+
+**用途**: 独自に定義したPythonクラスをpytreeとして扱えるように登録する。登録すると `jit`/`grad`/`vmap`/`tree_map` など、すべてのpytree対応APIで自作クラスのインスタンスを辞書やリストと同じように(内部の属性ごとに)扱えるようになる。
+
+**シグネチャ**: `jax.tree_util.register_pytree_node(nodetype: 'type[T]', flatten_func: 'Callable[[T], tuple[_Children, _AuxData]]', unflatten_func: 'Callable[[_AuxData, _Children], T]', flatten_with_keys_func=None) -> 'None'`
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    def __repr__(self):
+        return f"Point(x={self.x}, y={self.y})"
+
+def point_flatten(p):
+    return (p.x, p.y), None
+
+def point_unflatten(aux_data, children):
+    return Point(*children)
+
+jax.tree_util.register_pytree_node(Point, point_flatten, point_unflatten)
+
+p = Point(jnp.array(1.0), jnp.array(2.0))
+print(jax.tree_util.tree_leaves(p))
+print(jax.tree_util.tree_map(lambda v: v * 2, p))
+```
+実行結果:
+```
+[Array(1., dtype=float32, weak_type=True), Array(2., dtype=float32, weak_type=True)]
+Point(x=2.0, y=4.0)
+```
+
+**注意点・落とし穴**:
+- 登録しない場合、自作クラスは「1つの不透明な葉」として扱われ、中の属性(`x`, `y`)には分解されない。
+- `flatten_func` は `(children, aux_data)` のタプルを返す必要がある。`aux_data` は微分・vmap の対象にならない「静的な補助情報」で、ハッシュ可能である必要がある(今回は使わないので `None`)。
+
+---
+
+#### `jax.tree_util.register_pytree_node_class`
+
+**用途**: `register_pytree_node` のクラスデコレータ版。クラス自身に `tree_flatten`/`tree_unflatten` メソッドを定義し、デコレータを1行付けるだけでpytree登録できる。
+
+**シグネチャ**: `jax.tree_util.register_pytree_node_class(cls: 'Typ') -> 'Typ'`
+
+**使用例**(登録した自作クラスをそのまま `jax.jit` された関数の引数・戻り値として使う):
+```python
+import jax
+import jax.numpy as jnp
+
+@jax.tree_util.register_pytree_node_class
+class Vec2:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    def tree_flatten(self):
+        return (self.x, self.y), None
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+    def __repr__(self):
+        return f"Vec2({self.x}, {self.y})"
+
+@jax.jit
+def add(a, b):
+    return Vec2(a.x + b.x, a.y + b.y)
+
+v1 = Vec2(jnp.array(1.0), jnp.array(2.0))
+v2 = Vec2(jnp.array(10.0), jnp.array(20.0))
+print(add(v1, v2))
+```
+実行結果:
+```
+Vec2(11.0, 22.0)
+```
+
+**注意点・落とし穴**:
+- `tree_unflatten` は慣例として `classmethod` で定義する。これにより自作クラスを、辞書やリストと全く同じ感覚で `jit`/`grad`/`vmap` に直接渡せるようになる(equinox など、この仕組みの上にモデル定義APIを構築しているライブラリもある)。
+
+---
+
+#### `jax.tree_util.tree_map` の `is_leaf` 引数
+
+**用途**: 通常は「葉」とみなされないコンテナ(リストなど)を、`is_leaf` に渡した述語がTrueを返した時点で「その位置で葉として扱う」ようにする。
+
+**使用例**:
+```python
+import jax
+
+tree = {"a": [1, 2], "b": [3, 4]}
+# 既定: リストの中身(数値)が葉として扱われる
+print(jax.tree_util.tree_map(lambda x: x * 10, tree))
+# is_leaf でリスト自体を葉として扱わせる
+print(jax.tree_util.tree_map(lambda x: sum(x), tree, is_leaf=lambda x: isinstance(x, list)))
+```
+実行結果:
+```
+{'a': [10, 20], 'b': [30, 40]}
+{'a': 3, 'b': 7}
+```
+
+**注意点・落とし穴**:
+- `is_leaf` がTrueを返した部分木は、それ以上再帰的に分解されない。`None` を「葉ではなく空のpytree」として無視したくない場合(`is_leaf=lambda x: x is None`)など、既定の分解ルールを部分的に上書きしたいときに使う。
+
+---
+
+### jax.debug応用(callback/breakpoint)
+
+#### `jax.debug.callback(callback, *args, ordered=False, ...)`
+
+**用途**: `jit`/`vmap`/`scan` でトレースされたコードの中から、任意のPython関数(ファイルへのログ書き込み、可視化ライブラリの呼び出しなど、純粋なPython側の副作用)をランタイムで呼び出す。`jax.debug.print` より自由度が高い汎用版。
+
+**シグネチャ**: `jax.debug.callback(callback: 'Callable[..., None] | None' = None, *args: 'Any', ordered: 'bool' = False, partitioned: 'bool' = False, **kwargs: 'Any') -> 'Callable[..., None] | None'`
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+
+def host_side_effect(x):
+    print("host received:", x, type(x))
+
+@jax.jit
+def f(x):
+    jax.debug.callback(host_side_effect, x)
+    return x * 2
+
+print(f(jnp.array([1.0, 2.0, 3.0])))
+```
+実行結果:
+```
+host received: [1. 2. 3.] <class 'jaxlib._jax.ArrayImpl'>
+[2. 4. 6.]
+```
+
+**注意点・落とし穴**:
+- `callback` が受け取る引数は具体的な値(`ArrayImpl`)であり、トレーサではない。ただし `callback` の戻り値は計算グラフに戻せず(戻り値なしの副作用専用)、`callback` 内の処理は `jax.grad` の微分対象にもならない。
+
+---
+
+#### `jax.debug.breakpoint(...)`
+
+**用途**: `jit` 化されたコードの実行を一時停止し、対話的なデバッガ(`jdb`)を起動して、その時点でのランタイムの実際の値を確認できる。
+
+**シグネチャ**: `jax.debug.breakpoint(*, backend: 'str | None' = None, filter_frames: 'bool' = True, num_frames: 'int | None' = None, ordered: 'bool' = False, token=None, **kwargs)`
+
+**使用例**(標準入力から `p y`(変数`y`を表示)、続けて `c`(続行)を与えて実行):
+```python
+import jax
+import jax.numpy as jnp
+
+@jax.jit
+def f(x):
+    y = x * 2
+    jax.debug.breakpoint()
+    return y + 1
+
+print(f(jnp.array(3.0)))
+```
+実行結果(`printf 'p y\nc\n' | python script.py` として実行):
+```
+Entering jdb:
+(jdb) Array(6., dtype=float32)
+(jdb) 7.0
+```
+
+**注意点・落とし穴**:
+- 通常の `pdb` と違い、ブレークポイントで見える変数はトレーサではなく実際のランタイムの値(`Array(6., dtype=float32)`)。`jit` 内部の計算をステップ実行しながら実データを確認できる。
+- 対話端末がない環境(パイプ実行やCIなど)では標準入力からコマンドを与えないと停止したまま入力待ちになる点に注意。
+
+---
+
+### Flax/optaxの高度な機能
+
+#### `flax.linen.initializers`(カスタムパラメータ初期化)
+
+**用途**: `Dense`/`Conv` などの `kernel_init`/`bias_init` に渡す初期化関数群。numpyの乱数生成器と違い、`(key, shape, dtype)` を受け取って配列を返す関数として定義されている。
+
+**シグネチャ**(代表例): `nn.initializers.constant(value: 'ArrayLike', dtype=None) -> 'Initializer'` / `nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(), dtype=None) -> 'Initializer'`
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+
+key = jax.random.key(0)
+init_fn = nn.initializers.constant(0.5)
+print(init_fn(key, (2, 3), jnp.float32))
+
+dense = nn.Dense(features=3, kernel_init=nn.initializers.zeros, bias_init=nn.initializers.constant(1.0))
+params = dense.init(key, jnp.ones((1, 4)))
+print(params)
+```
+実行結果:
+```
+[[0.5 0.5 0.5]
+ [0.5 0.5 0.5]]
+{'params': {'bias': Array([1., 1., 1.], dtype=float32), 'kernel': Array([[0., 0., 0.],
+       [0., 0., 0.],
+       [0., 0., 0.],
+       [0., 0., 0.]], dtype=float32)}}
+```
+
+**注意点・落とし穴**:
+- `Dense` の既定 `kernel_init` は `lecun_normal`(前述の `flax.linen.Dense` の項を参照)。学習が不安定なときや再現実験のために、ゼロ初期化や定数初期化を明示的に指定したい場面で `kernel_init`/`bias_init` を差し替える。
+
+---
+
+#### Flaxの可変コレクション(mutable state, 例: `BatchNorm`)
+
+**用途**: 勾配降下で更新される `params` とは別に、学習中に統計量として更新される値(`BatchNorm` の running mean/var など)を「別のコレクション」として管理する仕組み。`model.apply(variables, x, mutable=['batch_stats'])` で更新後の状態を明示的に取得する。
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+
+class Net(nn.Module):
+    @nn.compact
+    def __call__(self, x, train: bool):
+        x = nn.Dense(features=4)(x)
+        x = nn.BatchNorm(use_running_average=not train)(x)
+        return x
+
+model = Net()
+key = jax.random.key(0)
+x = jnp.ones((2, 3))
+variables = model.init(key, x, train=True)
+print(list(variables.keys()))
+
+out, updated_state = model.apply(variables, x, train=True, mutable=["batch_stats"])
+print("before:", variables["batch_stats"])
+print("after :", updated_state["batch_stats"])
+```
+実行結果:
+```
+['params', 'batch_stats']
+before: {'BatchNorm_0': {'mean': Array([0., 0., 0., 0.], dtype=float32), 'var': Array([1., 1., 1., 1.], dtype=float32)}}
+after : {'BatchNorm_0': {'mean': Array([-0.00178755,  0.01625545, -0.01243106, -0.0002554 ], dtype=float32), 'var': Array([0.99, 0.99, 0.99, 0.99], dtype=float32)}}
+```
+
+**注意点・落とし穴**:
+- `mutable=[...]` を指定しないと `apply` はモデルの出力だけを返し、更新後の統計量は得られない(指定すると `(出力, 更新後variables)` のタプルになる)。
+- `params` は `optax` の勾配変換で更新されるのに対し、`batch_stats` は勾配とは無関係にフォワードパスのたびに更新される値なので、学習ループでは両者を別々に(例えば `TrainState` を拡張して)管理する必要がある。
+
+---
+
+#### `flax.training.train_state.TrainState` の保存・復元(`orbax.checkpoint`)
+
+**用途**: 学習途中の `TrainState`(パラメータ+オプティマイザ状態)をディスクに保存し、後で復元する。flax は保存・復元のバックエンドとして `orbax.checkpoint` を使う。
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+import optax
+from flax.training import train_state
+import orbax.checkpoint as ocp
+
+class Model(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(features=1)(x)
+
+model = Model()
+key = jax.random.key(0)
+x = jnp.ones((1, 2))
+params = model.init(key, x)
+state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(0.1))
+
+ckptr = ocp.PyTreeCheckpointer()
+path = "/tmp/orbax_ckpt_test/state"
+ckptr.save(path, state)
+print("saved   :", state.params["params"]["Dense_0"]["kernel"])
+
+restored = ckptr.restore(path, item=state)
+print("restored:", restored.params["params"]["Dense_0"]["kernel"])
+print(type(restored))
+```
+実行結果:
+```
+saved   : [[-1.1679986]
+ [ 0.5335484]]
+restored: [[-1.1679986]
+ [ 0.5335484]]
+<class 'flax.training.train_state.TrainState'>
+```
+
+**注意点・落とし穴**:
+- `restore` 時に `UserWarning: Sharding info not provided when restoring. Populating sharding info from sharding file. ...` という警告が出た。これはこの検証環境がCPU1個の単一デバイスであることに起因するもので、保存時と異なるデバイス構成で復元する際に関わる注意書きであり、今回の単一デバイスでの復元結果自体には影響していない。
+- `ckptr.restore(path, item=state)` のように `item` に既存の(構造だけ合わせた)`TrainState` を渡すことで、復元後も正しい型(`TrainState`)・pytree構造で返ってくる。
+
+---
+
+#### `flax.linen.remat(target, ...)`(FlaxモジュールへのcheckpointingRemat適用)
+
+**用途**: 前述の `jax.checkpoint` をFlaxの `Module` に直接適用するためのラッパー。`target`(Moduleクラス)を `nn.remat()` で包むだけで、そのモジュールの順伝播がチェックポイント対象になる。
+
+**使用例**:
+```python
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+
+class Block(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        jax.debug.print("block forward, x={}", x)
+        return nn.Dense(features=4)(x)
+
+RematBlock = nn.remat(Block)
+
+class Net(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        x = RematBlock()(x)
+        x = RematBlock()(x)
+        return jnp.sum(x)
+
+model = Net()
+key = jax.random.key(0)
+x = jnp.ones((1, 4))
+params = model.init(key, x)
+print("=== jax.grad(model.apply) ===")
+grads = jax.grad(model.apply)(params, x)
+print(list(params["params"].keys()))
+```
+実行結果:
+```
+block forward, x=[[1. 1. 1. 1.]]
+block forward, x=[[-0.01332378 -1.2157038  -0.5753304   1.633639  ]]
+=== jax.grad(model.apply) ===
+block forward, x=[[1. 1. 1. 1.]]
+block forward, x=[[-0.01332378 -1.2157038  -0.5753304   1.633639  ]]
+block forward, x=[[-0.01332378 -1.2157038  -0.5753304   1.633639  ]]
+block forward, x=[[1. 1. 1. 1.]]
+```
+
+**注意点・落とし穴**:
+- `init` の1回の順伝播では各 `Block` は1回ずつしか呼ばれないが、`jax.grad` による逆伝播計算では順伝播が再度実行され、呼び出し回数が倍になっている(`jax.checkpoint` と同じ再計算の挙動)。
+- `nn.remat()` で包んだモジュールは、自動的に `CheckpointBlock_0`、`CheckpointBlock_1` のような名前でパラメータツリーに現れる(`print(list(params["params"].keys()))` の結果より)。
+
+---
+
+#### `optax.chain(...)` + `optax.clip_by_global_norm(max_norm)`
+
+**用途**: 複数の勾配変換(`GradientTransformation`)を1つに合成する。勾配爆発を防ぐノルムクリッピングを、SGD/Adamなどの更新則の前段に挟むのが定番の組み合わせ。
+
+**シグネチャ**: `optax.chain(*args: GradientTransformation) -> GradientTransformationExtraArgs` / `optax.clip_by_global_norm(max_norm) -> GradientTransformation`
+
+**使用例**:
+```python
+import jax.numpy as jnp
+import optax
+
+params = {"w": jnp.array([1.0, 2.0])}
+tx = optax.chain(
+    optax.clip_by_global_norm(1.0),
+    optax.sgd(learning_rate=1.0),
+)
+opt_state = tx.init(params)
+huge_grad = {"w": jnp.array([100.0, 100.0])}
+updates, opt_state = tx.update(huge_grad, opt_state, params)
+print("clipped  :", updates)
+
+no_clip_tx = optax.sgd(learning_rate=1.0)
+no_clip_state = no_clip_tx.init(params)
+updates2, _ = no_clip_tx.update(huge_grad, no_clip_state, params)
+print("unclipped:", updates2)
+```
+実行結果:
+```
+clipped  : {'w': Array([-0.7071068, -0.7071068], dtype=float32)}
+unclipped: {'w': Array([-100., -100.], dtype=float32)}
+```
+
+**注意点・落とし穴**:
+- `chain` に渡した順に変換が適用される(この例ではまずノルムを1.0にクリップしてから、SGDの更新量=`-learning_rate * grad` を計算している)。極端に大きな勾配(`100.0`)が、ノルム1.0の範囲(`-0.707...`、すなわち `[100,100]` 方向を保ったまま長さ1に正規化した値)に収まっていることが分かる。
+
+---
+
+#### 学習率スケジュール(`optax.exponential_decay` など)
+
+**用途**: 学習率を定数ではなく、ステップ数に応じて変化する関数として指定する。`optax.adam(learning_rate=schedule)` のように、コール可能なスケジュール関数をそのまま渡せる。
+
+**シグネチャ**: `optax.exponential_decay(init_value, transition_steps: int, decay_rate: float, transition_begin: int = 0, staircase: bool = False, end_value=None) -> Callable[[step], value]`
+
+**使用例**:
+```python
+import jax.numpy as jnp
+import optax
+
+schedule = optax.exponential_decay(init_value=0.1, transition_steps=2, decay_rate=0.5)
+print([float(schedule(s)) for s in range(5)])
+
+tx = optax.adam(learning_rate=schedule)
+params = {"w": jnp.array(1.0)}
+opt_state = tx.init(params)
+for step in range(3):
+    grads = {"w": jnp.array(1.0)}
+    updates, opt_state = tx.update(grads, opt_state, params)
+    params = optax.apply_updates(params, updates)
+    print(step, params["w"])
+```
+実行結果:
+```
+[0.10000000149011612, 0.0707106813788414, 0.05000000074505806, 0.0353553406894207, 0.02500000037252903]
+0 0.9000007
+1 0.82929075
+2 0.7792909
+```
+
+**注意点・落とし穴**:
+- `schedule` はステップ数(整数)を受け取り学習率(float)を返すだけの普通の関数で、`optax` の各種オプティマイザの `learning_rate` 引数にそのまま渡せる(内部でオプティマイザの状態からステップ数を追跡し、毎回 `schedule(step)` を呼んでいる)。
+- 出力の学習率の列(`0.1, 0.0707..., 0.05, ...`)は `transition_steps=2` ごとに `decay_rate=0.5` 倍されていく(指数関数的減衰)ことに対応している。

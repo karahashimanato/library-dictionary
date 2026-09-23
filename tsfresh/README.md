@@ -14,6 +14,11 @@ tsfresh 0.21.2 で検証済み
 6. [ローリング特徴量](#ローリング特徴量)
 7. [パイプライン統合](#パイプライン統合)
 8. [ユーティリティ](#ユーティリティ)
+9. [応用・発展](#応用発展)
+   - [設定・分散処理](#設定分散処理)
+   - [カスタム特徴量計算関数の自作](#カスタム特徴量計算関数の自作)
+   - [`extract_features` の高度なオプション](#extract_features-の高度なオプション)
+   - [学習・推論を意識したユーティリティ](#学習推論を意識したユーティリティ)
 
 ---
 
@@ -690,3 +695,404 @@ raised: Columns ['a'] of DataFrame must not contain NaN values
 
 **注意点・落とし穴**:
 - 戻り値による通知ではなく `ValueError` の送出で異常を知らせる。`select_features` などを呼ぶ前に `impute()` を忘れると、この関数由来のエラーで処理が止まることがある。
+
+---
+
+## 応用・発展
+
+### 設定・分散処理
+
+#### `kind_to_fc_parameters` と `default_fc_parameters` の併用
+
+**用途**: `column_kind` で種類分けした時系列に対し、種類(kind)ごとに異なる特徴量セットを `kind_to_fc_parameters` で個別指定する。指定されなかった kind には `default_fc_parameters` がフォールバックとして使われる。
+
+**シグネチャ**: `extract_features(..., default_fc_parameters=None, kind_to_fc_parameters=None, ...)` の該当引数。`kind_to_fc_parameters` は `{kind名: fc_parameters辞書}` の形。
+
+**使用例**:
+```python
+import pandas as pd
+from tsfresh import extract_features
+from tsfresh.feature_extraction import MinimalFCParameters
+
+df_kind = pd.DataFrame({
+    "id": [1] * 12,
+    "time": list(range(4)) * 3,
+    "kind": ["temp"] * 4 + ["pressure"] * 4 + ["humidity"] * 4,
+    "value": [20.0, 21.0, 22.0, 23.0, 1.0, 1.1, 1.2, 1.3, 50.0, 51.0, 52.0, 53.0],
+})
+kind_to_fc_parameters = {"temp": {"mean": None}}
+
+# default_fc_parameters を指定した場合: temp以外(pressure/humidity)はそちらにフォールバック
+extracted_with_default = extract_features(
+    df_kind, column_id="id", column_sort="time", column_kind="kind", column_value="value",
+    default_fc_parameters=MinimalFCParameters(),
+    kind_to_fc_parameters=kind_to_fc_parameters, n_jobs=0, disable_progressbar=True,
+)
+print("default_fc_parameters指定あり:", extracted_with_default.shape)
+
+# default_fc_parameters を省略した場合
+extracted_without_default = extract_features(
+    df_kind, column_id="id", column_sort="time", column_kind="kind", column_value="value",
+    kind_to_fc_parameters=kind_to_fc_parameters, n_jobs=0, disable_progressbar=True,
+)
+print("default_fc_parameters省略:", extracted_without_default.shape)
+print(extracted_without_default.columns.tolist())
+```
+実行結果:
+```
+default_fc_parameters指定あり: (1, 21)
+default_fc_parameters省略: (1, 1)
+['temp__mean']
+```
+
+**注意点・落とし穴**:
+- `kind_to_fc_parameters` を指定して `default_fc_parameters` を省略すると、`default_fc_parameters` は `ComprehensiveFCParameters()` ではなく**空辞書 `{}`** になる(`extraction.py` の実装で `kind_to_fc_parameters is not None` の場合はこの挙動)。結果として `kind_to_fc_parameters` に列挙されていない kind(この例では pressure/humidity)は特徴量が**1列も計算されない**まま静かに欠落する。全kindに何らかの特徴量を持たせたい場合は、`default_fc_parameters` を明示的に指定すること。
+
+#### `MultiprocessingDistributor`(分散処理)
+
+**用途**: `extract_features` の並列実行を担う既定の分散実行クラス。`n_jobs` 引数の裏側で暗黙的に使われているものを明示的にインスタンス化し、`distributor` 引数として渡せる。
+
+**シグネチャ**: `MultiprocessingDistributor(n_workers, disable_progressbar=False, progressbar_title='Feature Extraction', show_warnings=True)`(`tsfresh.utilities.distribution` モジュール)
+
+**使用例**:
+```python
+import numpy as np
+import pandas as pd
+from tsfresh import extract_features
+from tsfresh.feature_extraction import MinimalFCParameters
+from tsfresh.utilities.distribution import MultiprocessingDistributor
+
+np.random.seed(0)
+rows = []
+for id_ in range(1, 6):
+    for t in range(10):
+        rows.append({"id": id_, "time": t, "value": np.sin(t / 3) + id_ + np.random.normal(0, 0.1)})
+df = pd.DataFrame(rows)
+
+distributor = MultiprocessingDistributor(n_workers=2, disable_progressbar=True, show_warnings=False)
+extracted = extract_features(
+    df, column_id="id", column_sort="time", default_fc_parameters=MinimalFCParameters(),
+    distributor=distributor,
+)
+print(extracted.shape)
+print(extracted.index.tolist())
+```
+実行結果:
+```
+(5, 10)
+[1, 2, 3, 4, 5]
+```
+
+**注意点・落とし穴**:
+- `distributor` を渡す場合、並列度は `distributor` 生成時の `n_workers` で決まり、`extract_features` 側の `n_jobs` 引数は使われない(両方渡しても `distributor` が優先される)。
+
+#### `LocalDaskDistributor`(dask未インストール時の挙動)
+
+**用途**: dask の分散実行基盤(`distributed`)上で特徴量抽出を並列化するための `Distributor`。大規模データをクラスタ/ローカルの複数プロセスに分散したい場合に使う。
+
+**シグネチャ**: `LocalDaskDistributor(n_workers)`(`tsfresh.utilities.distribution` モジュール)
+
+**使用例**:
+```python
+from tsfresh.utilities.distribution import LocalDaskDistributor
+
+try:
+    d = LocalDaskDistributor(n_workers=2)
+    print("created", d)
+except Exception as e:
+    print(type(e).__name__, e)
+```
+実行結果:
+```
+ModuleNotFoundError No module named 'distributed'
+```
+
+**注意点・落とし穴**:
+- 検証環境(tsfresh 0.21.2, Python 3.12)には `dask` 自体もインストールされておらず、`LocalDaskDistributor` は `dask.distributed`(`distributed` パッケージ)への依存を内部で `import` するため、未インストール環境では**インスタンス化した瞬間に** `ModuleNotFoundError` になることを確認した。tsfresh の基本インストール(`pip install tsfresh`)には dask 系パッケージは含まれないため、使う場合は別途 `pip install dask distributed` 等が必要。
+
+---
+
+### カスタム特徴量計算関数の自作
+
+#### `@set_property("fctype", "simple")` による自作関数の登録
+
+**用途**: 既存の特徴量計算関数だけでは足りない独自指標(例: 値の範囲=最大値-最小値)を自作し、`extract_features` の `default_fc_parameters`/`kind_to_fc_parameters` にそのまま渡して計算させる。
+
+**シグネチャ**: `tsfresh.feature_extraction.feature_calculators.set_property(key, value)` はデコレータファクトリで、関数オブジェクトに属性を1つ設定するだけ(`func.fctype = "simple"` と同義)。`fctype` が `"simple"` の関数は `func(x)` の形(パラメータなし)または `func(x, **param)` の形(パラメータあり)で呼ばれる。
+
+**使用例**:
+```python
+import numpy as np
+import pandas as pd
+from tsfresh import extract_features
+from tsfresh.feature_extraction.feature_calculators import set_property
+
+@set_property("fctype", "simple")
+def peak_to_peak(x):
+    x = np.asarray(x)
+    return np.max(x) - np.min(x)
+
+df = pd.DataFrame({
+    "id": [1, 1, 1, 1, 2, 2, 2, 2],
+    "time": [0, 1, 2, 3, 0, 1, 2, 3],
+    "value": [1.0, 5.0, 2.0, 3.0, 10.0, 10.0, 10.0, 10.0],
+})
+
+# 関数名の文字列ではなく、関数オブジェクトそのものを辞書のキーにできる
+fc_parameters = {peak_to_peak: None}
+extracted = extract_features(
+    df, column_id="id", column_sort="time",
+    default_fc_parameters=fc_parameters, n_jobs=0, disable_progressbar=True,
+)
+print(extracted)
+```
+実行結果:
+```
+   value__peak_to_peak
+1                  4.0
+2                  0.0
+```
+
+**注意点・落とし穴**:
+- `extract_features` の内部実装(`_do_extraction_on_chunk`)は `fc_parameters` 辞書のキーが `callable` であればそれをそのまま関数として使い、文字列であれば `tsfresh.feature_extraction.feature_calculators` モジュールから同名属性を `getattr` で探す。つまり自作関数を `feature_calculators` モジュールに登録(モンキーパッチ)しなくても、**関数オブジェクトを辞書のキーとして直接渡せば動く**(この例で検証済み)。
+- 出力列名は `<kind>__<関数の__name__>` になる(`param` があれば `__<key>` が続く)。`fctype` を設定し忘れると `getattr(func, "fctype", None)` が `None` になり、`combiner` 用の呼び出し分岐に入らず `simple` 扱いされる(パラメータなし関数なら問題ないが、`param` を使う関数では `combiner` の指定が必須)。
+
+#### `@set_property("fctype", "combiner")` によるパラメータ付き複数特徴量の自作
+
+**用途**: 1回の計算で複数のパラメータ(例: 複数のパーセンタイル区間)に対応する複数の特徴量列をまとめて生成する自作関数を作る。`fft_coefficient` や `linear_trend` と同じ「combiner」型。
+
+**シグネチャ**: `fctype="combiner"` の関数は `func(x, param)` の形で呼ばれ、`(名前文字列, 値)` のタプルを列挙する**ジェネレータ**を返す必要がある。
+
+**使用例**:
+```python
+import numpy as np
+import pandas as pd
+from tsfresh import extract_features
+from tsfresh.feature_extraction.feature_calculators import set_property
+
+@set_property("fctype", "combiner")
+def quantile_range(x, param):
+    x = np.asarray(x)
+    for p in param:
+        lo, hi = np.percentile(x, p["low"]), np.percentile(x, p["high"])
+        yield f'low_{p["low"]}__high_{p["high"]}', hi - lo
+
+df = pd.DataFrame({
+    "id": [1, 1, 1, 1, 2, 2, 2, 2],
+    "time": [0, 1, 2, 3, 0, 1, 2, 3],
+    "value": [1.0, 5.0, 2.0, 3.0, 10.0, 20.0, 10.0, 10.0],
+})
+fc_parameters = {quantile_range: [{"low": 10, "high": 90}]}
+extracted = extract_features(
+    df, column_id="id", column_sort="time",
+    default_fc_parameters=fc_parameters, n_jobs=0, disable_progressbar=True,
+)
+print(extracted)
+```
+実行結果:
+```
+   value__quantile_range__low_10__high_90
+1                                     3.1
+2                                     7.0
+```
+
+**注意点・落とし穴**:
+- `combiner` 型では `param`(この例では `[{"low": 10, "high": 90}]`)に含まれる各要素ごとに1つの `(名前, 値)` を `yield` する。複数要素を渡せば1回の関数呼び出しで複数列を一度に生成できる(`simple` 型は `param` の要素ごとに関数を毎回呼び直す点が異なる)。
+- `simple` 型の関数に `param` 付きのリストを渡しても動くが、`combiner` 型の関数を `fctype` を `"simple"` のまま(デコレータを付け忘れた状態)で使うと `func(x, **param)` として呼ばれてしまい `TypeError`(`param` という名の引数がないため)になる。
+
+---
+
+### `extract_features` の高度なオプション
+
+#### `impute_function`(抽出直後の欠損値処理)
+
+**用途**: `extract_features` が返す前に、生成された特徴量DataFrameへ自動で欠損値補完関数を適用させる。`ar_coefficient` の `k` が系列長より大きい場合などに生じる `NaN` を、後段で別途 `impute()` を呼ばずにその場で解消できる。
+
+**シグネチャ**: `extract_features(..., impute_function=None)`。`impute_function` には `impute(df)` のような「DataFrameを受け取りinplaceで書き換える(あるいは書き換えて返す)」関数を渡す。
+
+**使用例**:
+```python
+import pandas as pd
+from tsfresh import extract_features
+from tsfresh.utilities.dataframe_functions import impute
+
+df = pd.DataFrame({
+    "id": [1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+    "time": [0, 1, 2, 3, 4, 0, 1, 2, 3, 4],
+    "value": [0.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+})
+fc = {"ar_coefficient": [{"coeff": 0, "k": 10}], "mean": None}
+
+extracted_raw = extract_features(df, column_id="id", column_sort="time",
+                                  default_fc_parameters=fc, n_jobs=0, disable_progressbar=True)
+print("impute_functionなし:\n", extracted_raw)
+
+extracted_imp = extract_features(df, column_id="id", column_sort="time", default_fc_parameters=fc,
+                                  n_jobs=0, disable_progressbar=True, impute_function=impute)
+print("impute_function=imputeあり:\n", extracted_imp)
+```
+実行結果:
+```
+impute_functionなし:
+    value__ar_coefficient__coeff_0__k_10  value__mean
+1                                    NaN          2.0
+2                                    NaN          3.0
+impute_function=imputeあり:
+    value__ar_coefficient__coeff_0__k_10  value__mean
+1                                    0.0          2.0
+2                                    0.0          3.0
+```
+
+**注意点・落とし穴**:
+- `ar_coefficient__k_10` は系列長5点に対し `k=10` のAR係数を要求しており計算不能なため常に `NaN` になる。`impute_function=impute` を渡すと、この `NaN` はその場で「列内の他の値の中央値」(ここでは他idの値も同じ列に1つしかないため中央値=最小値=最大値相当)に置き換えられる。`extract_relevant_features` はこのオプションと似た効果を内部の `impute` 呼び出しで実現している。
+
+#### `chunksize`(並列化の粒度調整)
+
+**用途**: マルチプロセス並列実行時に、1つのワーカープロセスへまとめて渡す「1id×1kindの時系列」の個数を制御する。大量のid/kindがある場合のプロセス間通信オーバーヘッドを調整するためのチューニング用パラメータ。
+
+**シグネチャ**: `extract_features(..., chunksize=None)`。`None` の場合は distributor 側のヒューリスティックで自動決定される。
+
+**使用例**:
+```python
+import numpy as np
+import pandas as pd
+from tsfresh import extract_features
+from tsfresh.feature_extraction import MinimalFCParameters
+
+np.random.seed(0)
+rows = []
+for id_ in range(1, 7):
+    for t in range(5):
+        rows.append({"id": id_, "time": t, "value": float(t + id_)})
+df = pd.DataFrame(rows)
+
+extracted = extract_features(df, column_id="id", column_sort="time",
+                              default_fc_parameters=MinimalFCParameters(),
+                              n_jobs=0, disable_progressbar=True, chunksize=2)
+print(extracted.shape)
+print(extracted.index.tolist())
+```
+実行結果:
+```
+(6, 10)
+[1, 2, 3, 4, 5, 6]
+```
+
+**注意点・落とし穴**:
+- `chunksize` は計算結果そのものには影響しない(あくまで内部の並列化単位)。公式ドキュメント(docstring)によれば「1チャンク=1つのid・kindの時系列」を基準とし、`chunksize=10` なら1タスクで10系列分を計算する。メモリ不足が出る場合は値を小さくするとよい、とdocstringに明記されている。
+
+#### `profile` / `profiling_filename`(内部プロファイリング)
+
+**用途**: 特徴量抽出処理そのものを Python 標準の `cProfile` でプロファイリングし、関数ごとの呼び出し回数・所要時間をファイルへ出力する。どの特徴量計算関数がボトルネックかを調べたい場合に使う。
+
+**シグネチャ**: `extract_features(..., profile=False, profiling_filename='profile.txt', profiling_sorting='cumulative')`
+
+**使用例**:
+```python
+import os
+import pandas as pd
+from tsfresh import extract_features
+from tsfresh.feature_extraction import MinimalFCParameters
+
+df = pd.DataFrame({
+    "id": [1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+    "time": [0, 1, 2, 3, 4, 0, 1, 2, 3, 4],
+    "value": [0.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+})
+profile_path = "/tmp/tsfresh_profile_example.txt"
+extracted = extract_features(df, column_id="id", column_sort="time",
+                              default_fc_parameters=MinimalFCParameters(),
+                              n_jobs=0, disable_progressbar=True,
+                              profile=True, profiling_filename=profile_path)
+print("shape:", extracted.shape)
+print("プロファイルファイル存在:", os.path.exists(profile_path))
+with open(profile_path) as f:
+    print(f.read().splitlines()[0])
+os.remove(profile_path)
+```
+実行結果:
+```
+shape: (2, 10)
+プロファイルファイル存在: True
+         5010 function calls (4923 primitive calls) in 0.010 seconds
+```
+
+**注意点・落とし穴**:
+- `profiling_filename` は実行時のカレントディレクトリからの相対パスでも絶対パスでも指定可能(この例では絶対パスを使用)。出力内容は `cProfile.Profile().dump_stats()` 相当ではなく `pstats.Stats` のテキストダンプ(`print_stats()` 出力)で、`profiling_sorting`(デフォルト `'cumulative'`)で並び替え基準を変更できる。
+
+---
+
+### 学習・推論を意識したユーティリティ
+
+#### `get_range_values_per_column` / `impute_dataframe_range`(train/testで一貫した補完)
+
+**用途**: 訓練データの各列の最大値・最小値・中央値を `get_range_values_per_column` で取得し、それをテストデータ側の `impute_dataframe_range` に渡すことで、「テストデータの補完に訓練データの統計量だけを使う」というデータリークを避けた補完が行える。
+
+**シグネチャ**: `get_range_values_per_column(df)` は `(col_to_max, col_to_min, col_to_median)` の3つの `dict` を返す。`impute_dataframe_range(df_impute, col_to_max, col_to_min, col_to_median)` はその3つを受け取り `df_impute` をinplaceで補完する。
+
+**使用例**:
+```python
+import numpy as np
+import pandas as pd
+from tsfresh.utilities.dataframe_functions import impute_dataframe_range, get_range_values_per_column
+
+X_train = pd.DataFrame({"a": [1.0, 2.0, 3.0, np.nan], "b": [10.0, np.nan, 30.0, 40.0]})
+col_max, col_min, col_median = get_range_values_per_column(X_train)
+print("max:", col_max)
+print("min:", col_min)
+print("median:", col_median)
+
+X_test = pd.DataFrame({"a": [np.nan, 100.0, -100.0], "b": [np.inf, -np.inf, np.nan]})
+impute_dataframe_range(X_test, col_max, col_min, col_median)
+print(X_test)
+```
+実行結果:
+```
+max: {'a': np.float64(3.0), 'b': np.float64(40.0)}
+min: {'a': np.float64(1.0), 'b': np.float64(10.0)}
+median: {'a': np.float64(2.0), 'b': np.float64(30.0)}
+       a     b
+0    2.0  40.0
+1  100.0  10.0
+2 -100.0  30.0
+```
+
+**注意点・落とし穴**:
+- `impute_dataframe_range` が置き換えるのは `NaN`(→中央値)・`+inf`(→最大値)・`-inf`(→最小値)の3種類のみで、範囲外の有限値(この例の `a` 列の `100.0`/`-100.0`)は**クリッピングされずそのまま残る**。「訓練データの範囲に収める」処理ではなく、あくまで欠損・無限大の補完専用である点に注意。
+- 基底の `impute(df)` は列ごとに `df` 自身から範囲を計算する(訓練/テストを分けない)のに対し、この2関数の組み合わせは範囲の計算元(`X_train`)と補完対象(`X_test`)を分離できる点が異なる。
+
+#### `add_sub_time_series_index`(固定長の非重複サブ系列への分割)
+
+**用途**: 1つの時系列を、重なりのない固定長 `sub_length` のサブ系列に分割し、それぞれに新しい `id` を振り直す。`roll_time_series` が「累積的に伸びる重複ウィンドウ」を作るのに対し、こちらは「重ならない固定長の区間」に単純分割する。
+
+**シグネチャ**: `add_sub_time_series_index(df_or_dict, sub_length, column_id=None, column_sort=None, column_kind=None)`
+
+**使用例**:
+```python
+import pandas as pd
+from tsfresh.utilities.dataframe_functions import add_sub_time_series_index
+
+df = pd.DataFrame({
+    "id": [1] * 4 + [2] * 4,
+    "time": list(range(4)) * 2,
+    "value": [10, 20, 30, 40, 100, 200, 300, 400],
+})
+result = add_sub_time_series_index(df, sub_length=2, column_id="id", column_sort="time")
+print(result)
+```
+実行結果:
+```
+   time  value      id
+0     0     10  (0, 1)
+4     0    100  (0, 2)
+5     1    200  (0, 2)
+1     1     20  (0, 1)
+6     2    300  (1, 2)
+2     2     30  (1, 1)
+3     3     40  (1, 1)
+7     3    400  (1, 2)
+```
+
+**注意点・落とし穴**:
+- 新しい `id` 列は `(サブ系列の連番, 元のid)` のタプルになる(`roll_time_series` の `(元のid, ウィンドウ末尾の時刻)` とは要素の順序も意味も異なるので混同しないこと)。
+- 元の系列長が `sub_length` の倍数でない場合、端数分は切り捨てられずに短いサブ系列として残る(この関数自体には端数を捨てるオプションはなく、後段の `extract_features` 側で系列長依存の特徴量に `NaN` が出うる点は他のローリング系関数と同様)。

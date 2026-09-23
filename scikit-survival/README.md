@@ -12,6 +12,12 @@ scikit-survival 0.28.0 で検証済み。すべてのシグネチャ・実行結
 6. [ノンパラメトリック推定・群間比較](#6-ノンパラメトリック推定群間比較)
 7. [評価指標](#7-評価指標)
 8. [予測(生存関数・累積ハザード・リスクスコア)](#8-予測生存関数累積ハザードリスクスコア)
+9. [応用・発展](#9-応用発展)
+    - [ハイパーパラメータチューニング](#ハイパーパラメータチューニング)
+    - [競合リスク・時間依存共変量への対応状況](#競合リスク時間依存共変量への対応状況)
+    - [パイプライン統合](#パイプライン統合)
+    - [モデルの永続化(joblib)](#モデルの永続化joblib)
+    - [発展的な生存SVM・メタ推定器](#発展的な生存svmメタ推定器)
 
 ---
 
@@ -817,3 +823,380 @@ predict (risk score)[:5]: [70.828 40.199 28.95  90.295  1.228]
 
 **注意点・落とし穴**:
 - モデルによって`predict()`が返す値のスケール・意味が異なる。`CoxPHSurvivalAnalysis`/木・アンサンブル系は「相対的なリスクスコア」(モデル間で値のスケールを比較できない)を返すが、`IPCRidge`だけは例外的に「生存時間そのもの」を返す(3章参照)。`concordance_index_*`などの評価関数に渡す際は、対象のモデルがどちらのタイプかを`predict()`のドキュメントで確認する必要がある。
+
+---
+
+## 9. 応用・発展
+
+以下は、`load_whas500`をカテゴリ変数エンコード後に`train_test_split(test_size=0.25, random_state=0)`で分割した`Xtr, Xte, ytr, yte`(3章のCox回帰の例と同じ分割)を主に使う。
+
+### ハイパーパラメータチューニング
+
+#### `as_concordance_index_ipcw_scorer(...)`
+
+**用途**: 打ち切りを考慮したIPCW一致指数(`concordance_index_ipcw`)を、scikit-learnの`GridSearchCV`などがそのまま使える「メタ推定器兼スコアラー」として提供する。推定器をラップし、`.fit`/`.score`をIPCW一致指数ベースに差し替える。
+
+**シグネチャ**: `sksurv.metrics.as_concordance_index_ipcw_scorer(estimator, tau=None, tied_tol=1e-08)`
+
+**使用例**:
+```python
+from sklearn.model_selection import GridSearchCV
+from sksurv.linear_model import CoxPHSurvivalAnalysis
+from sksurv.metrics import as_concordance_index_ipcw_scorer
+
+tau = ytr["lenfol"].max() * 0.9  # 打ち切り分布のIPCWが不安定になる最大時刻付近を避ける
+est = as_concordance_index_ipcw_scorer(CoxPHSurvivalAnalysis(), tau=tau)
+param_grid = {"estimator__alpha": [0.001, 0.01, 0.1, 1.0, 10.0]}
+gcv = GridSearchCV(est, param_grid, cv=3)
+gcv.fit(Xtr, ytr)
+print("best_params_:", gcv.best_params_)
+print("best_score_:", gcv.best_score_)
+print("test score:", gcv.score(Xte, yte))
+```
+実行結果:
+```
+best_params_: {'estimator__alpha': 1.0}
+best_score_: 0.7564699953687343
+test score: 0.786443529012979
+```
+
+**注意点・落とし穴**:
+- ラップ対象の推定器のハイパーパラメータは、`GridSearchCV`の`param_grid`では`estimator__`プレフィックスを付けて指定する(`as_concordance_index_ipcw_scorer`が返すオブジェクト自身のパラメータ名が`estimator`であるため)。
+- **`tau`を指定しないと、CVの分割方法によっては`ValueError: censoring survival function is zero at one or more time points`で学習が失敗することがある**(実行確認済み: WHAS500を`cv=3`で分割すると、あるfoldの検証データの最大観測時刻がそのfoldの学習データの打ち切り分布の範囲外に出てしまうケースが起きる)。`GridSearchCV`は失敗したfoldのスコアを`nan`にして警告を出すだけで例外を上に伝播させないため、`best_score_`が`nan`にならないか結果を必ず確認すること。`tau`(評価対象時間の上限)を学習データの最大観測時刻より小さく設定すると回避できることが多い。
+
+#### `as_integrated_brier_score_scorer(...)`
+
+**用途**: 積分ブライアスコア(IBS)を`GridSearchCV`で使えるスコアラーにする。IBSは値が小さいほど良い指標だが、scikit-learnの「スコアは大きいほど良い」という規約に合わせるため、**符号を反転した値**(負のIBS)を返す。
+
+**シグネチャ**: `sksurv.metrics.as_integrated_brier_score_scorer(estimator, times)`
+
+**使用例**:
+```python
+import numpy as np
+from sksurv.metrics import as_integrated_brier_score_scorer
+
+times = np.percentile(ytr["lenfol"], np.linspace(5, 60, 10))
+est = as_integrated_brier_score_scorer(CoxPHSurvivalAnalysis(), times)
+param_grid = {"estimator__alpha": [0.01, 0.1, 1.0]}
+gcv = GridSearchCV(est, param_grid, cv=3)
+gcv.fit(Xtr, ytr)
+print("best_params_:", gcv.best_params_)
+print("best_score_:", gcv.best_score_)
+```
+実行結果:
+```
+best_params_: {'estimator__alpha': 1.0}
+best_score_: -0.1637977618965549
+```
+
+**注意点・落とし穴**:
+- `best_score_`が負の値(`-0.1638`)になっているのは`predict_survival_function`の予測誤差がゼロではないという意味であり、バグではない。「大きい(0に近い)ほど良い」向きにするための符号反転である点を理解していないと、一見スコアが悪化しているように誤読しやすい。
+- `times`は`brier_score`/`integrated_brier_score`と同様、学習・検証それぞれのfoldの追跡時間の範囲内に収まっている必要がある。範囲外だと`as_concordance_index_ipcw_scorer`と同種のエラーで学習が失敗する。
+
+#### `as_cumulative_dynamic_auc_scorer(...)`
+
+**用途**: 時間依存AUC(`cumulative_dynamic_auc`の平均AUC)を`GridSearchCV`で使えるスコアラーにする。
+
+**シグネチャ**: `sksurv.metrics.as_cumulative_dynamic_auc_scorer(estimator, times, tied_tol=1e-08)`
+
+**使用例**:
+```python
+from sksurv.metrics import as_cumulative_dynamic_auc_scorer
+
+est = as_cumulative_dynamic_auc_scorer(CoxPHSurvivalAnalysis(alpha=0.1), times)
+est.fit(Xtr, ytr)
+print("score (mean AUC) on test:", est.score(Xte, yte))
+```
+実行結果:
+```
+score (mean AUC) on test: 0.8333514023431929
+```
+
+**注意点・落とし穴**:
+- 上の単純な`fit`/`score`は問題なく動くが、これを**そのまま`GridSearchCV(cv=3)`に渡すと、`times`の上限を`as_concordance_index_ipcw_scorer`の例と同程度に絞っても`ValueError: censoring survival function is zero at one or more time points`や`ValueError: time must be smaller than largest observed time point: ...`で失敗することを実行して確認した**(WHAS500・`cv=3`または`StratifiedKFold(4)`のいずれでも再現)。原因は各CV foldの検証データに含まれるイベント時刻が、そのfoldの学習データから推定した打ち切り分布(Kaplan-Meier)の観測範囲を超えてしまうこと。`as_concordance_index_ipcw_scorer`より`times`の制約が厳しく実務では扱いにくいため、`GridSearchCV`と組み合わせる場合は事前に`times`を学習データの最大観測時刻より十分小さく取る、またはCVのfold数を増やす・層化するなどの対策が要る。単一の学習・評価分割で使う分には問題ない。
+
+---
+
+### 競合リスク・時間依存共変量への対応状況
+
+#### `cumulative_incidence_competing_risks(...)`
+
+**用途**: 打ち切りに加えて、複数の排他的なイベント種別(競合リスク)がある場合に、ノンパラメトリックに各リスクの累積罹患確率(cumulative incidence function, CIF)を推定する。
+
+**シグネチャ**: `sksurv.nonparametric.cumulative_incidence_competing_risks(event, time_exit, time_min=None, conf_level=0.95, conf_type=None, var_type='Aalen')`
+
+**使用例**:
+```python
+from sksurv.datasets import load_bmt
+from sksurv.nonparametric import cumulative_incidence_competing_risks
+
+X_bmt, y_bmt = load_bmt()
+event, time = y_bmt["status"], y_bmt["ftime"]  # event: 0=打ち切り, 1/2=競合する2種類のリスク
+print("event unique:", set(event))
+
+x, ci, conf_int = cumulative_incidence_competing_risks(event, time, conf_type="log-log")
+print("x[:5]:", x[:5])
+print("ci.shape:", ci.shape)
+print("ci[:, :5]:")
+print(ci[:, :5].round(4))
+print("conf_int.shape:", conf_int.shape)
+```
+実行結果:
+```
+event unique: {np.int64(0), np.int64(1), np.int64(2)}
+x[:5]: [0. 1. 2. 3. 4.]
+ci.shape: (3, 21)
+ci[:, :5]:
+[[0.0571 0.1143 0.1429 0.2611 0.3498]
+ [0.0286 0.0571 0.0571 0.1458 0.2049]
+ [0.0286 0.0571 0.0857 0.1153 0.1448]]
+conf_int.shape: (3, 2, 21)
+```
+
+**注意点・落とし穴**:
+- `event`は`Surv.from_arrays`が使うbool配列ではなく、**0=打ち切り、1〜n_risks=各リスク種別を表す非負整数配列**を渡す(`kaplan_meier_estimator`などとは仕様が異なる)。
+- 戻り値`ci`の1行目(`ci[0]`)は「いずれかのリスクが発生する」全体の累積罹患確率、2行目以降(`ci[1:]`)が各リスク個別の累積罹患確率。`conf_int`も同様に`(n_risks + 1, 2, n_times)`の形。
+- **正直な確認結果として、scikit-survival 0.28.0がサポートする競合リスクへの対応は、このノンパラメトリックなCIF推定(および前述の`get_x_y`の`competing_risks`引数によるデータ整形)までであり、共変量を使って競合リスクを回帰する手法(Fine-Grayの部分分布ハザードモデルなど)は実装されていない。** `sksurv`パッケージ全体を`grep -ri "fine-gray\|fine gray"`で検索してもヒットせず(実行確認済み)、`sksurv.linear_model`/`sksurv.ensemble`/`sksurv.svm`にも競合リスク回帰専用のクラスは存在しない。共変量付きの競合リスク回帰が必要な場合は`lifelines`(`CoxPHFitter`のcompeting risks拡張や`AalenJohansenFitter`)など他ライブラリの検討が必要。
+- **同様に、時間依存共変量(time-varying covariates)にも対応していない。** `inspect.signature(CoxPHSurvivalAnalysis.fit)`を実行すると`(self, X, y)`のみで、`lifelines.CoxTimeVaryingFitter`のような`start`/`stop`区間を渡す仕組みは存在しない(実行確認済み)。scikit-survivalの全推定器は「1サンプル=1行の固定共変量」を前提としている。
+
+---
+
+### パイプライン統合
+
+#### `Pipeline` + `CoxPHSurvivalAnalysis`
+
+**用途**: scikit-learnの`Pipeline`にscikit-survivalの前処理・推定器をそのまま組み込む。生データ(カテゴリ列を含むDataFrame)から前処理〜Cox回帰まで一つの`fit`/`predict`/`score`にまとめられる。
+
+**シグネチャ**: `sklearn.pipeline.Pipeline(steps, *, transform_input=None, memory=None, verbose=False)`(scikit-survival固有の追加シグネチャはなし。scikit-learn互換の`Transformer`/`Estimator`であれば組み込める)
+
+**使用例**:
+```python
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sksurv.datasets import load_whas500
+from sksurv.preprocessing import OneHotEncoder
+from sksurv.linear_model import CoxPHSurvivalAnalysis
+
+X_raw, y = load_whas500()
+Xtr_raw, Xte_raw, ytr, yte = train_test_split(X_raw, y, test_size=0.25, random_state=0)
+
+pipe = Pipeline([
+    ("onehot", OneHotEncoder()),       # sksurv.preprocessing: カテゴリ列をダミー変数化
+    ("scale", StandardScaler()),       # sklearn: 数値列を標準化
+    ("cox", CoxPHSurvivalAnalysis()),
+])
+pipe.fit(Xtr_raw, ytr)
+print("score:", pipe.score(Xte_raw, yte))
+print("predict[:3]:", pipe.predict(Xte_raw[:3]).round(3))
+```
+実行結果:
+```
+score: 0.8070936463383516
+predict[:3]: [ 0.221 -0.42  -0.888]
+```
+
+**注意点・落とし穴**:
+- ここでの`score`(0.8070936463383516)は、3章で`encode_categorical`を使い標準化なしで学習した`CoxPHSurvivalAnalysis`のC-index(同じく0.8070936463383516)と**完全に一致する**(実行確認済み)。Cox回帰の一致指数(順位のみに依存する指標)は特徴量の線形スケーリングに対して不変なため。ただし係数`coef_`の値そのものはスケーリングの有無で変わるので、係数の解釈をする場合は標準化の有無を意識する必要がある。
+- `sksurv.preprocessing.OneHotEncoder`は`fit_transform`時に学習データに存在したカテゴリを記憶する。テストデータに学習データにない新規カテゴリ値が含まれると、`ColumnTransformer`の`OneHotEncoder`のような`handle_unknown`オプションは無いため挙動に注意(未知カテゴリの扱いは明示的に確認していない)。
+
+#### `GridSearchCV` + `Pipeline`(ネストしたチューニング)
+
+**用途**: 前処理を含む`Pipeline`全体を`as_concordance_index_ipcw_scorer`でラップし、`GridSearchCV`で前処理込みのハイパーパラメータ(ここでは`CoxnetSurvivalAnalysis`の`alphas`)を探索する。
+
+**シグネチャ**: `sklearn.model_selection.GridSearchCV(estimator, param_grid, ...)`(前掲の`as_concordance_index_ipcw_scorer`と`Pipeline`を組み合わせて使う)
+
+**使用例**:
+```python
+from sksurv.linear_model import CoxnetSurvivalAnalysis
+from sksurv.metrics import as_concordance_index_ipcw_scorer
+
+pipe2 = Pipeline([
+    ("onehot", OneHotEncoder()),
+    ("scale", StandardScaler()),
+    ("model", CoxnetSurvivalAnalysis(l1_ratio=0.9, fit_baseline_model=True)),
+])
+tau = ytr["lenfol"].max() * 0.9
+scored_pipe = as_concordance_index_ipcw_scorer(pipe2, tau=tau)
+# Pipelineのステップ名(model)__ハイパーパラメータ名 の前に estimator__ を重ねて指定する
+param_grid = {"estimator__model__alphas": [[0.05], [0.02], [0.01], [0.005]]}
+gcv = GridSearchCV(scored_pipe, param_grid, cv=3)
+gcv.fit(Xtr_raw, ytr)
+print("best_params_:", gcv.best_params_)
+print("best_score_:", round(gcv.best_score_, 4))
+print("test score:", round(gcv.score(Xte_raw, yte), 4))
+```
+実行結果:
+```
+best_params_: {'estimator__model__alphas': [0.05]}
+best_score_: 0.7617
+test score: 0.7713
+```
+
+**注意点・落とし穴**:
+- `param_grid`のキーは`estimator__model__alphas`のように、「スコアラーのパラメータ名(`estimator`)」→「`Pipeline`のステップ名(`model`)」→「推定器自身のパラメータ名(`alphas`)」の順に`__`で連結する(ネストが1段増えるごとに`__`も1段増える)。
+- `CoxnetSurvivalAnalysis`本来の挙動(3章参照)は`alphas`未指定で正則化パス全体を一度に学習するが、ここでは`alphas=[0.05]`のように**単一の値をリストで**渡して1点だけを評価させている。`alphas`に複数値を含むリストを渡すと、`Coxnet`内部でそのパス全体を学習してしまい`GridSearchCV`が意図した「1パラメータ=1候補」の探索にならないため、チューニング目的では単一値のリストにする必要がある。
+
+---
+
+### モデルの永続化(joblib)
+
+#### `joblib.dump(...)`
+
+**用途**: 学習済みのscikit-survival推定器(scikit-learn互換オブジェクト)をファイルにシリアライズして保存する。
+
+**シグネチャ**: `joblib.dump(value, filename, compress=0, protocol=None)`
+
+**使用例**:
+```python
+import joblib
+from sksurv.linear_model import CoxPHSurvivalAnalysis
+
+cph = CoxPHSurvivalAnalysis()
+cph.fit(Xtr, ytr)
+joblib.dump(cph, "/tmp/cph_model.joblib")
+print("saved. score on Xte:", cph.score(Xte, yte))
+```
+実行結果:
+```
+saved. score on Xte: 0.8070936463383516
+```
+
+**注意点・落とし穴**:
+- scikit-survivalの推定器はscikit-learnの`BaseEstimator`を継承しているだけの通常のPythonオブジェクトであり、保存・読み込みの仕組みはscikit-learnの推定器と同じ(`joblib`が標準的に推奨される)。scikit-survival固有のシリアライズ機構は無い。
+- `pickle.dump`でも動作はするが、`joblib`の方がnumpy配列を含む大きなオブジェクトの保存・読み込みが高速な場合が多く、scikit-learn公式ドキュメントでも慣例的に`joblib`が使われる。
+
+#### `joblib.load(...)`
+
+**用途**: `joblib.dump`で保存したモデルファイルを読み込み、学習済み推定器として復元する。
+
+**シグネチャ**: `joblib.load(filename, mmap_mode=None, ensure_native_byte_order='auto')`
+
+**使用例**(別プロセスで実行して検証):
+```python
+import joblib
+
+loaded = joblib.load("/tmp/cph_model.joblib")
+print("loaded type:", type(loaded))
+print("score on Xte (reloaded model):", loaded.score(Xte, yte))
+print("predict[:5]:", loaded.predict(Xte[:5]).round(3))
+```
+実行結果:
+```
+loaded type: <class 'sksurv.linear_model.coxph.CoxPHSurvivalAnalysis'>
+score on Xte (reloaded model): 0.8070936463383516
+predict[:5]: [2.464 1.823 1.355 2.944 0.306]
+```
+
+**注意点・落とし穴**:
+- 別プロセスで`joblib.load`した後の`score`/`predict`の値が、保存前の元モデルの値(3章の`CoxPHSurvivalAnalysis`の例と同じ`[2.464 1.823 1.355 2.944 0.306]`)と完全に一致することを実際にプロセスを分けて確認した。学習済みパラメータ(`coef_`など)だけでなく、内部でベースラインハザード推定に使うオブジェクトなども含めて復元される。
+- `joblib`はPythonのバージョンやscikit-learn/scikit-survivalのバージョンをまたいだ互換性を保証しない。保存時と異なるバージョン環境で読み込むと、警告なしに誤った結果になったり例外になったりするリスクがあるため、モデルを長期保存する場合は保存時のライブラリバージョンも一緒に記録しておくことが望ましい。
+
+---
+
+### 発展的な生存SVM・メタ推定器
+
+#### `NaiveSurvivalSVM(...)`
+
+**用途**: `FastSurvivalSVM`とは別の実装で、比較可能なサンプルペアの特徴量差分から新しいデータセットを作り、通常の線形SVM(liblinear)で学習する「素朴な」生存SVM。
+
+**シグネチャ**: `sksurv.svm.NaiveSurvivalSVM(penalty='l2', loss='squared_hinge', *, dual=False, tol=0.0001, alpha=1.0, verbose=0, random_state=None, max_iter=1000)`
+
+**使用例**:
+```python
+from sksurv.svm import NaiveSurvivalSVM
+
+nsvm = NaiveSurvivalSVM(alpha=1.0, max_iter=1000, random_state=0)
+nsvm.fit(Xtr, ytr)
+print("score:", nsvm.score(Xte, yte))
+print("predict[:3]:", nsvm.predict(Xte[:3]).round(3))
+```
+実行結果:
+```
+score: 0.7994386323041592
+predict[:3]: [1.125 0.929 0.702]
+```
+
+**注意点・落とし穴**:
+- クラスのdocstring(`NaiveSurvivalSVM.__doc__`)に明記されている通り、比較可能な全ペアの差分を計算して新しいデータセットを作るため**空間計算量が`O(n_samples^2)`**になる。`FastSurvivalSVM`はペアの差分データセットを明示的に作らない、より効率的な最適化アルゴリズムを採用していると公式docstringに説明されているが、具体的な計算量オーダーはdocstring中に明記されておらず未確認。「名前通り、`NaiveSurvivalSVM`は教育的・比較用の素朴な実装」という位置づけはdocstringの記述(class docstringの冒頭)に基づく。
+
+#### `MinlipSurvivalAnalysis(...)`
+
+**用途**: `FastKernelSurvivalSVM`と関連するが、最大マージンではなく「最小Lipschitz平滑性」を基準にした異なる目的関数を最小化する生存モデル。
+
+**シグネチャ**: `sksurv.svm.MinlipSurvivalAnalysis(alpha=1.0, *, solver='ecos', kernel='linear', gamma=None, degree=3, coef0=1, kernel_params=None, pairs='nearest', verbose=False, timeit=None, max_iter=None)`
+
+**使用例**:
+```python
+from sksurv.svm import MinlipSurvivalAnalysis
+
+minlip = MinlipSurvivalAnalysis(alpha=1.0, solver="ecos")
+minlip.fit(Xtr, ytr)
+print("score:", minlip.score(Xte, yte))
+```
+実行結果:
+```
+score: 0.7991834651696862
+```
+
+**注意点・落とし穴**:
+- `solver='ecos'`がデフォルト(凸最適化ソルバーECOSを使う)。`FastSurvivalSVM`系の準ニュートン最適化とは異なる最適化バックエンドに依存しており、追加の依存パッケージ(`ecos`)が必要になる。
+- `pairs='nearest'`がデフォルトで、`HingeLossSurvivalSVM`(後述、デフォルト`pairs='all'`)より考慮するペア数が少なく、計算量を抑える設計になっている。
+
+#### `HingeLossSurvivalSVM(...)`
+
+**用途**: `NaiveSurvivalSVM`のカーネル版(非線形カーネルに対応した素朴な生存SVM)。
+
+**シグネチャ**: `sksurv.svm.HingeLossSurvivalSVM(alpha=1.0, *, solver='ecos', kernel='linear', gamma=None, degree=3, coef0=1, kernel_params=None, pairs='all', verbose=False, timeit=None, max_iter=None)`
+
+**使用例**(計算量が非常に大きいため、学習・評価データを意図的に小さく絞っている):
+```python
+from sksurv.svm import HingeLossSurvivalSVM
+
+Xtr_small, ytr_small = Xtr.iloc[:40], ytr[:40]
+Xte_small, yte_small = Xte.iloc[:20], yte[:20]
+
+hsvm = HingeLossSurvivalSVM(alpha=1.0, kernel="linear")
+hsvm.fit(Xtr_small, ytr_small)
+print("score:", hsvm.score(Xte_small, yte_small))
+print("predict[:3]:", hsvm.predict(Xte_small[:3]).round(3))
+```
+実行結果:
+```
+score: 0.7857142857142857
+predict[:3]: [4.249 3.869 5.783]
+```
+
+**注意点・落とし穴**:
+- **クラスdocstringに明記されている通り空間計算量`O(n_samples^4)`・時間計算量`O(n_samples^6 * n_features)`という極めて重い計算量を要求する**(`NaiveSurvivalSVM`の`O(n_samples^2)`よりさらに重い)。この検証でも全データ(375学習サンプル)ではなく先頭40サンプルに絞って実行している。実務でそのまま数百〜数千サンプル規模のデータに使うのは現実的でなく、`FastKernelSurvivalSVM`(準ニュートン法ベース)の方が実用的な選択肢になる。
+
+#### `Stacking(...)`
+
+**用途**: 複数の生存モデル(ベース推定器)の予測を、メタ推定器(通常はCox回帰など)でさらに統合するスタッキングアンサンブル。
+
+**シグネチャ**: `sksurv.meta.Stacking(meta_estimator, base_estimators, *, probabilities=True)`
+
+**使用例**:
+```python
+from sksurv.meta import Stacking
+from sksurv.svm import FastSurvivalSVM
+
+base = [
+    ("coxph", CoxPHSurvivalAnalysis()),
+    ("svm", FastSurvivalSVM(max_iter=1000, random_state=0)),
+]
+stack = Stacking(CoxPHSurvivalAnalysis(), base, probabilities=False)
+stack.fit(Xtr, ytr)
+print("score:", stack.score(Xte, yte))
+print("meta coef_ (coxph, svmの重み):", stack.meta_estimator.coef_)
+```
+実行結果:
+```
+score: 0.8070936463383516
+meta coef_ (coxph, svmの重み): [1.0000000e+00 1.3546381e-13]
+```
+
+**注意点・落とし穴**:
+- `base_estimators`は`(名前, 推定器)`のタプルのリストで、scikit-learnの`VotingClassifier`などと同じ書式。`meta_estimator`は各ベース推定器の予測値(この例では`coxph`と`svm`の2列)を新たな特徴量として学習する。
+- この例では`meta coef_`が`[1.0, ~0]`となっており、**メタ推定器がほぼ`coxph`の予測だけを採用し`svm`の予測をほぼ無視した**ことが分かる(実行確認済み)。結果として`Stacking`全体のスコア(0.8070936463383516)は単体の`CoxPHSurvivalAnalysis`のスコア(3章参照、同じく0.8070936463383516)と一致している。スタッキングは自動的に性能を改善する保証はなく、ベース推定器同士の予測が似ている(強い相関がある)場合はこのように実質的に1つのモデルへ縮退することがある点に注意。
+- `probabilities=True`(デフォルト)は「ベース推定器が`predict_proba`を持っていればそれを使い、無ければ`predict()`にフォールバックする」という実装になっている(実行確認: `Stacking._predict_estimators`のソースを確認、および`predict_proba`を持たない`FastSurvivalSVM`を`probabilities=True`のまま`base_estimators`に含めても`fit`はエラーにならないことを実際に実行して確認した)。scikit-survivalの推定器はいずれも`predict_proba`を持たないため、この例のように`probabilities=False`を明示しても実際の挙動(`predict()`を使う)は変わらない。`probabilities`引数は分類器も扱える`sksurv.meta`の共通実装に由来するオプションで、生存モデルだけを使う場合は実質的に意味を持たない。
