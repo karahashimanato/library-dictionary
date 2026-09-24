@@ -27,11 +27,15 @@ Python主要ライブラリの関数・API逆引き辞書。ライブラリご�
 | pymc | 6.3.1 | [pymc/README.md](pymc/README.md) |
 | pytensor | 3.3.0 | [pytensor/README.md](pytensor/README.md) |
 | jax | 0.11.1 | [jax/README.md](jax/README.md) |
+| numpyro | 0.21.0 | [numpyro/README.md](numpyro/README.md) |
 | ruptures | 1.1.10 | [ruptures/README.md](ruptures/README.md) |
 | scikit-survival | 0.28.0 | [scikit-survival/README.md](scikit-survival/README.md) |
 | tsfresh | 0.21.2 | [tsfresh/README.md](tsfresh/README.md) |
 | pyod | 3.6.5 | [pyod/README.md](pyod/README.md) |
 | featuretools | 1.31.0 | [featuretools/README.md](featuretools/README.md) |
+| xarray | 2026.2.0 | [xarray/README.md](xarray/README.md) |
+| numba | 0.66.0 | [numba/README.md](numba/README.md) |
+| pyarrow | 25.0.1 | [pyarrow/README.md](pyarrow/README.md) |
 
 ## 比較ドキュメント
 
