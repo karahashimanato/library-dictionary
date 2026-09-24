@@ -36,6 +36,7 @@ Python主要ライブラリの関数・API逆引き辞書。ライブラリご�
 | xarray | 2026.2.0 | [xarray/README.md](xarray/README.md) |
 | numba | 0.66.0 | [numba/README.md](numba/README.md) |
 | pyarrow | 25.0.1 | [pyarrow/README.md](pyarrow/README.md) |
+| arviz | 1.3.0 | [arviz/README.md](arviz/README.md) |
 
 ## 比較ドキュメント
 

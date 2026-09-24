@@ -636,12 +636,12 @@ Group: /posterior
 ```
 
 **注意点・落とし穴**:
-- **バージョン固有の注意(実測で確認)**: ArviZ 1.3.0ではこれらの戻り値は素の`xarray.Dataset`ではなく`posterior`グループを持つ`xarray.DataTree`になっている。値を取り出すには`az.rhat(idata)["posterior"]["mu"].item()`のようにグループを経由する。
+- **バージョン固有の注意(実測で確認)**: ArviZ 1.3.0ではこれらの戻り値は素の`xarray.Dataset`ではなく、名前が`'posterior'`の`xarray.DataTree`になっている(変数`mu`・`sigma`は直下にある)。値は`az.rhat(idata)["mu"].item()`のように変数名で直接取り出す。`az.rhat(idata)["posterior"]["mu"]`のように`posterior`を経由すると`KeyError: 'Could not find node at posterior'`になる。
 - `method='rank'`(rhatのデフォルト)は、従来の分割Rhatより多峰性や裾の収束問題を検出しやすい改良版(rank-normalized R-hat)。
 
 ### `arviz.plot_trace(...)`
 
-**用途**: 各パラメータの事後分布(周辺分布)とトレース(サンプル列)を並べて可視化し、収束やダイバージェンスを目視確認する。
+**用途**: 各パラメータのトレース(チェーンごとのサンプル列)を可視化し、収束やチェーンの混ざり具合を目視確認する。
 
 **シグネチャ**: `arviz.plot_trace(dt, *, var_names=None, filter_vars=None, group='posterior', coords=None, sample_dims=None, plot_collection=None, backend=None, labeller=None, aes_by_visuals=None, visuals=None, **pc_kwargs)`
 
@@ -658,6 +658,7 @@ print(type(pc))
 
 **注意点・落とし穴**:
 - **バージョン固有の注意(実測で確認)**: ArviZ 1.3.0の`plot_trace`は、古いバージョンで一般的だった「matplotlibの`Axes`の2次元`ndarray`」ではなく、新しいプロット基盤(`arviz_plots`)の`PlotCollection`オブジェクトを返す。`axes[0, 0]`のようなインデックスアクセスは使えず、画像として保存するには`.savefig(path)`を使う。
+- **バージョン固有の注意(実測で確認)**: ArviZ 1.3.0の`plot_trace`はトレース(チェーンごとのサンプル列)だけを描き、0.x系の「左に周辺分布(密度)、右にトレース」という2列構成ではない(パラメータごとに1枚のトレースパネルが並ぶ)。周辺分布を見たい場合は別の関数を使う(詳しくは[arviz/README.md](../arviz/README.md))。
 - Jupyter上で単に評価すると自動的に描画されるが、スクリプト実行時はバックエンド(`matplotlib.use("Agg")`等)の設定と明示的な保存が必要。
 
 ### `pymc.compute_log_likelihood(...)`
@@ -671,7 +672,7 @@ print(type(pc))
 with m1:
     idata1 = pm.sample(draws=500, tune=500, chains=2, random_seed=0, progressbar=False)
     pm.compute_log_likelihood(idata1)
-print("log_likelihood" in idata1.groups())
+print("log_likelihood" in idata1.children)
 ```
 実行結果:
 ```
