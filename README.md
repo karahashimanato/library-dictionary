@@ -37,6 +37,11 @@ Python主要ライブラリの関数・API逆引き辞書。ライブラリご�
 | numba | 0.66.0 | [numba/README.md](numba/README.md) |
 | pyarrow | 25.0.1 | [pyarrow/README.md](pyarrow/README.md) |
 | arviz | 1.3.0 | [arviz/README.md](arviz/README.md) |
+| sympy | 1.14.0 | [sympy/README.md](sympy/README.md) |
+| joblib | 1.5.3 | [joblib/README.md](joblib/README.md) |
+| h5py | 3.16.0 | [h5py/README.md](h5py/README.md) |
+| pillow | 12.3.0 | [pillow/README.md](pillow/README.md) |
+| networkx | 3.6.1 | [networkx/README.md](networkx/README.md) |
 
 ## 比較ドキュメント
 
